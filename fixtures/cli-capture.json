@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "captures": [
+    {
+      "id": "daily-log-personal",
+      "cwd": "vault",
+      "command": [
+        "$OBSIDIAN_BASE_CLI",
+        "base:query",
+        "path=Bases/Daily log tasks.base",
+        "view=Personal",
+        "format=json"
+      ],
+      "output": "goldens/daily-log-personal.json"
+    },
+    {
+      "id": "daily-log-work",
+      "cwd": "vault",
+      "command": [
+        "$OBSIDIAN_BASE_CLI",
+        "base:query",
+        "path=Bases/Daily log tasks.base",
+        "view=Work",
+        "format=json"
+      ],
+      "output": "goldens/daily-log-work.json"
+    }
+  ]
+}

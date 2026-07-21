@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "vault_root": "vault",
+  "metadata": {
+    "Activities/Clean kitchen.md": { "ctime": "2026-06-01T00:00:00Z", "mtime": "2026-07-01T00:00:00Z" },
+    "Activities/Review work.md": { "ctime": "2026-06-02T00:00:00Z", "mtime": "2026-07-02T00:00:00Z" },
+    "Calendar/Daily/2026-07-10.md": { "ctime": "2026-07-10T00:00:00Z", "mtime": "2026-07-10T00:00:00Z" },
+    "Calendar/Daily/2026-07-15.md": { "ctime": "2026-07-15T00:00:00Z", "mtime": "2026-07-15T00:00:00Z" },
+    "Encounters/general note.md": { "ctime": "2026-07-12T00:00:00Z", "mtime": "2026-07-12T00:00:00Z" },
+    "Encounters/work note.md": { "ctime": "2026-07-11T00:00:00Z", "mtime": "2026-07-11T00:00:00Z" }
+  },
+  "scenarios": [
+    {
+      "id": "daily-log-personal",
+      "source": { "kind": "inline", "path": "Calendar/Daily/2026-07-15.md", "ordinal": 2 },
+      "host_path": "Calendar/Daily/2026-07-15.md",
+      "view": "Personal",
+      "expected_paths": ["Encounters/general note.md", "Activities/Clean kitchen.md"]
+    },
+    {
+      "id": "daily-log-work",
+      "source": { "kind": "inline", "path": "Calendar/Daily/2026-07-15.md", "ordinal": 2 },
+      "host_path": "Calendar/Daily/2026-07-15.md",
+      "view": "Work",
+      "expected_paths": ["Encounters/work note.md", "Activities/Review work.md"]
+    },
+    {
+      "id": "activity-tracker",
+      "source": { "kind": "inline", "path": "Calendar/Daily/2026-07-15.md", "ordinal": 1 },
+      "host_path": "Calendar/Daily/2026-07-15.md",
+      "view": "Activity tracker",
+      "expected_paths": ["Activities/Clean kitchen.md", "Activities/Review work.md"]
+    },
+    {
+      "id": "embedded-work-view",
+      "source": { "kind": "file", "path": "Bases/Daily log tasks.base" },
+      "host_path": "Calendar/Daily/2026-07-15.md",
+      "view": "Work",
+      "expected_paths": ["Encounters/work note.md", "Activities/Review work.md"]
+    }
+  ],
+  "overlays": [
+    {
+      "id": "overlay-promotes-personal-work",
+      "path": "Activities/Clean kitchen.md",
+      "contents_file": "overlays/Clean kitchen.work.md",
+      "expected_effect": "daily-log-work-includes-clean-kitchen"
+    }
+  ]
+}

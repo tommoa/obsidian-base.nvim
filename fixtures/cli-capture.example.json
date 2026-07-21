@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "captures": [
+    {
+      "id": "daily-log-personal",
+      "command": [
+        "/path/to/obsidian",
+        "<official-cli-subcommand-and-arguments>"
+      ],
+      "output": "goldens/daily-log-personal.json"
+    }
+  ]
+}

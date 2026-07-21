@@ -1,0 +1,7 @@
+{
+  "types": {
+    "completed": "date",
+    "rank": "number",
+    "tags": "tags"
+  }
+}

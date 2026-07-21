@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: obsidian-base-worker-x86_64-unknown-linux-musl
+            linux: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: obsidian-base-worker-aarch64-unknown-linux-musl
+            linux: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: obsidian-base-worker-x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: obsidian-base-worker-aarch64-apple-darwin
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            asset: obsidian-base-worker-x86_64-pc-windows-msvc.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Verify release tag
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: python scripts/metadata-check.py --tag "$VERSION"
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.85.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: worker
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.linux
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - run: cargo test --manifest-path worker/Cargo.toml --target ${{ matrix.target }} --locked
+      - run: cargo build --manifest-path worker/Cargo.toml --release --target ${{ matrix.target }} --locked
+      - name: Stage and test executable
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: python scripts/release-asset.py stage --target "$TARGET" --asset "$ASSET"
+      - name: Verify static Linux executable
+        if: matrix.linux
+        run: file '${{ matrix.asset }}' && ! ldd '${{ matrix.asset }}'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for asset in dist/obsidian-base-worker-*; do
+            sha256sum "$asset" > "$asset.sha256"
+          done
+          gh release create '${{ github.ref_name }}' dist/obsidian-base-worker-* --verify-tag --generate-notes
