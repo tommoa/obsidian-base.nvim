@@ -46,6 +46,7 @@ fn watches_new_nested_directories_and_publishes_after_rescan() {
     std::fs::write(root.path().join("Nested/Observed.md"), "# Observed\n").unwrap();
     let event = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(event["event"]["type"], "index_changed");
+    assert_eq!(event["event"]["origin"], "watch");
     writeln!(
         stdin,
         "{}",

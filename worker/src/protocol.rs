@@ -1,6 +1,9 @@
 //! Strict, typed JSON-lines protocol definitions.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    num::{NonZeroU64, NonZeroUsize},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -106,17 +109,17 @@ pub struct MetadataOverrideParams {
 #[serde(deny_unknown_fields)]
 pub struct LimitsPatch {
     /// Maximum text bytes accepted from vault files and overlays.
-    pub source_bytes: Option<usize>,
+    pub source_bytes: Option<NonZeroUsize>,
     /// Maximum bytes accepted by one expression source.
-    pub expression_bytes: Option<usize>,
+    pub expression_bytes: Option<NonZeroUsize>,
     /// Maximum wall-clock evaluation time in milliseconds.
-    pub query_ms: Option<u64>,
+    pub query_ms: Option<NonZeroU64>,
     /// Maximum evaluator operations per query.
-    pub evaluation_steps: Option<u64>,
+    pub evaluation_steps: Option<NonZeroU64>,
     /// Maximum rows retained for one result set.
-    pub result_rows: Option<usize>,
+    pub result_rows: Option<NonZeroUsize>,
     /// Maximum serialized bytes for a result payload.
-    pub result_bytes: Option<usize>,
+    pub result_bytes: Option<NonZeroUsize>,
 }
 
 /// Typed query inputs accepted by the evaluator.
@@ -249,6 +252,9 @@ pub struct ErrorPayload {
     pub code: String,
     /// Human-readable diagnostic for the caller.
     pub message: String,
+    /// Named views parsed from a query source, when available for recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_views: Option<Vec<View>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -281,6 +287,8 @@ pub struct QueryResult {
     pub source_id: String,
     /// Selected table view.
     pub view: View,
+    /// Named table views that the current UI can select.
+    pub available_views: Vec<View>,
     /// Rendered table columns.
     pub columns: Vec<Column>,
     /// Initial visible rows.
@@ -309,7 +317,7 @@ pub struct Column {
     pub label: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct View {
     /// Selected view name.
     pub name: String,
@@ -349,14 +357,28 @@ pub struct EventEnvelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// A new index snapshot was published.
-    IndexChanged { generation: u64, paths: Vec<String> },
+    IndexChanged {
+        generation: u64,
+        paths: Vec<String>,
+        origin: IndexChangeOrigin,
+    },
+}
+
+/// Cause of a published index generation.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexChangeOrigin {
+    /// An unsaved buffer overlay changed worker state.
+    Overlay,
+    /// The vault watcher detected an external filesystem change.
+    Watch,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum WorkerEnvelope {
     /// Request-correlated worker response.
-    Response(ResponseEnvelope),
+    Response(Box<ResponseEnvelope>),
     /// Asynchronous worker event.
     Event(EventEnvelope),
 }

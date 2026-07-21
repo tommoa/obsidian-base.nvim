@@ -1,13 +1,13 @@
 -- Owns validation, defaulting, and retrieval of the plugin's user configuration.
 local M = {}
 
----@class ObsidianBasesLimits
----@field source_bytes integer
----@field expression_bytes integer
----@field query_ms integer
----@field evaluation_steps integer
----@field result_rows integer
----@field result_bytes integer
+---@class ObsidianBasesLimitsPatch
+---@field source_bytes? integer
+---@field expression_bytes? integer
+---@field query_ms? integer
+---@field evaluation_steps? integer
+---@field result_rows? integer
+---@field result_bytes? integer
 
 ---@class ObsidianBasesPresentation
 ---@field rail string
@@ -16,15 +16,13 @@ local M = {}
 ---@class ObsidianBasesConfig
 ---@field worker_path? string
 ---@field max_preview_rows integer
----@field debounce_ms integer
 ---@field presentation ObsidianBasesPresentation
----@field limits ObsidianBasesLimits
+---@field limits ObsidianBasesLimitsPatch
 
 ---@type ObsidianBasesConfig
 local defaults = {
   worker_path = nil,
   max_preview_rows = 50,
-  debounce_ms = 150,
   presentation = {
     rail = "│ ",
     highlights = {
@@ -36,14 +34,7 @@ local defaults = {
       loading = "ObsidianBasesLoading",
     },
   },
-  limits = {
-    source_bytes = 1024 * 1024,
-    expression_bytes = 64 * 1024,
-    query_ms = 2000,
-    evaluation_steps = 5000000,
-    result_rows = 10000,
-    result_bytes = 4 * 1024 * 1024,
-  },
+  limits = vim.empty_dict(),
 }
 
 ---@type ObsidianBasesConfig
@@ -83,7 +74,6 @@ function M.setup(user_opts)
   reject_unknown(user_opts, {
     worker_path = true,
     max_preview_rows = true,
-    debounce_ms = true,
     presentation = true,
     limits = true,
   }, "")
@@ -118,7 +108,6 @@ function M.setup(user_opts)
     error("worker_path must be a non-empty executable path string or nil", 2)
   end
   if user_opts.max_preview_rows ~= nil then positive_integer(user_opts.max_preview_rows, "max_preview_rows") end
-  if user_opts.debounce_ms ~= nil then positive_integer(user_opts.debounce_ms, "debounce_ms") end
   if presentation.rail ~= nil and type(presentation.rail) ~= "string" then
     error("presentation.rail must be a string", 2)
   end
@@ -132,10 +121,9 @@ function M.setup(user_opts)
   opts = vim.deepcopy(defaults)
   opts.worker_path = user_opts.worker_path
   opts.max_preview_rows = user_opts.max_preview_rows or defaults.max_preview_rows
-  opts.debounce_ms = user_opts.debounce_ms or defaults.debounce_ms
   opts.presentation.rail = presentation.rail or defaults.presentation.rail
   for key, value in pairs(highlights) do opts.presentation.highlights[key] = value end
-  for key, value in pairs(limits) do opts.limits[key] = value end
+  opts.limits = next(limits) and vim.deepcopy(limits) or vim.empty_dict()
   return vim.deepcopy(opts)
 end
 

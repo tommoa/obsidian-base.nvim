@@ -55,22 +55,22 @@ impl Default for Limits {
 impl Limits {
     pub fn apply(mut self, patch: LimitsPatch) -> Self {
         if let Some(value) = patch.source_bytes {
-            self.input_bytes = value;
+            self.input_bytes = value.get();
         }
         if let Some(value) = patch.expression_bytes {
-            self.expression_bytes = value;
+            self.expression_bytes = value.get();
         }
         if let Some(value) = patch.query_ms {
-            self.evaluation_ms = value;
+            self.evaluation_ms = value.get();
         }
         if let Some(value) = patch.evaluation_steps {
-            self.evaluation_steps = value;
+            self.evaluation_steps = value.get();
         }
         if let Some(value) = patch.result_rows {
-            self.result_rows = value;
+            self.result_rows = value.get();
         }
         if let Some(value) = patch.result_bytes {
-            self.result_bytes = value;
+            self.result_bytes = value.get();
         }
         self
     }
@@ -108,5 +108,35 @@ impl Limits {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU64, NonZeroUsize};
+
+    use super::Limits;
+    use crate::protocol::LimitsPatch;
+
+    #[test]
+    fn empty_patch_retains_worker_defaults() {
+        let defaults = Limits::default();
+        let applied = defaults.apply(LimitsPatch::default());
+        assert_eq!(applied.input_bytes, defaults.input_bytes);
+        assert_eq!(applied.evaluation_ms, defaults.evaluation_ms);
+        assert_eq!(applied.result_rows, defaults.result_rows);
+    }
+
+    #[test]
+    fn patch_changes_only_supplied_limits() {
+        let defaults = Limits::default();
+        let applied = defaults.apply(LimitsPatch {
+            query_ms: Some(NonZeroU64::new(7).unwrap()),
+            result_bytes: Some(NonZeroUsize::new(9).unwrap()),
+            ..LimitsPatch::default()
+        });
+        assert_eq!(applied.evaluation_ms, 7);
+        assert_eq!(applied.result_bytes, 9);
+        assert_eq!(applied.input_bytes, defaults.input_bytes);
     }
 }

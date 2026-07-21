@@ -9,9 +9,10 @@ use tokio::{
 
 use crate::{
     protocol::{
-        ErrorPayload, EventEnvelope, Request, RequestId, ResponseEnvelope, WorkerEnvelope, decode,
+        ErrorPayload, Event, EventEnvelope, IndexChangeOrigin, Request, RequestId,
+        ResponseEnvelope, WorkerEnvelope, decode,
     },
-    service::WorkerService,
+    service::{IndexChange, WorkerService},
     watch::{VaultWatcher, WatchMessage},
 };
 
@@ -41,12 +42,8 @@ impl WorkerActor {
         input: mpsc::Sender<ActorMessage>,
         output: mpsc::UnboundedSender<WorkerEnvelope>,
     ) -> Self {
-        let event_output = output.clone();
-        let service = WorkerService::with_emitter(move |event| {
-            let _ = event_output.send(WorkerEnvelope::Event(EventEnvelope { event }));
-        });
         Self {
-            service,
+            service: WorkerService::new(),
             input,
             output,
             watcher: None,
@@ -101,24 +98,41 @@ impl WorkerActor {
             }
         };
         let id = envelope.id;
-        let starts_watcher = matches!(envelope.request, Request::Initialize(_));
-        let shutdown = matches!(envelope.request, Request::Shutdown(_));
+        let starts_watcher = matches!(&envelope.request, Request::Initialize(_));
+        let shutdown = matches!(&envelope.request, Request::Shutdown(_));
+        let overlay_change = matches!(
+            &envelope.request,
+            Request::OverlayUpsert(_) | Request::OverlayCommit(_) | Request::OverlayRemove(_)
+        );
         let result = self
             .blocking_service(move |service| service.handle(envelope.request))
             .await;
         match result {
-            Ok(Some(success)) => {
+            Ok(handled) => {
                 if starts_watcher {
                     self.start_watcher();
                 }
-                let _ = self
-                    .output
-                    .send(WorkerEnvelope::Response(ResponseEnvelope::success(
-                        id, success,
-                    )));
+                if let Some(change) = handled.index_change {
+                    if overlay_change {
+                        self.emit_index_changed(change, IndexChangeOrigin::Overlay);
+                    }
+                }
+                let _ = self.output.send(WorkerEnvelope::Response(Box::new(
+                    ResponseEnvelope::success(id, handled.success),
+                )));
             }
-            Ok(None) => {}
-            Err(error) => self.send_error(id, error.code, error.message),
+            Err(error) => {
+                let _ =
+                    self.output
+                        .send(WorkerEnvelope::Response(Box::new(ResponseEnvelope::error(
+                            id,
+                            ErrorPayload {
+                                code: error.code.to_owned(),
+                                message: error.message,
+                                available_views: error.available_views,
+                            },
+                        ))));
+            }
         }
         !shutdown
     }
@@ -126,13 +140,24 @@ impl WorkerActor {
     fn send_error(&self, id: RequestId, code: impl Into<String>, message: impl Into<String>) {
         let _ = self
             .output
-            .send(WorkerEnvelope::Response(ResponseEnvelope::error(
+            .send(WorkerEnvelope::Response(Box::new(ResponseEnvelope::error(
                 id,
                 ErrorPayload {
                     code: code.into(),
                     message: message.into(),
+                    available_views: None,
                 },
-            )));
+            ))));
+    }
+
+    fn emit_index_changed(&self, change: IndexChange, origin: IndexChangeOrigin) {
+        let _ = self.output.send(WorkerEnvelope::Event(EventEnvelope {
+            event: Event::IndexChanged {
+                generation: change.generation,
+                paths: change.paths,
+                origin,
+            },
+        }));
     }
 
     fn start_watcher(&mut self) {
@@ -150,12 +175,14 @@ impl WorkerActor {
         let paths = std::mem::take(&mut self.pending_paths)
             .into_iter()
             .collect();
-        if let Err(error) = self
+        match self
             .blocking_service(move |service| service.reindex_external(paths))
             .await
         {
-            self.service
-                .record_watcher_error(format!("watcher rescan failed: {}", error.message));
+            Ok(change) => self.emit_index_changed(change, IndexChangeOrigin::Watch),
+            Err(error) => self
+                .service
+                .record_watcher_error(format!("watcher rescan failed: {}", error.message)),
         }
     }
 

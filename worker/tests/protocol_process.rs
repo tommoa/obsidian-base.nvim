@@ -56,6 +56,7 @@ fn framing_pipeline_event_order_and_shutdown() {
     assert_eq!(envelopes[1]["id"], 1);
     assert_eq!(envelopes[2]["id"], 2);
     assert_eq!(envelopes[3]["event"]["type"], "index_changed");
+    assert_eq!(envelopes[3]["event"]["origin"], "overlay");
     assert_eq!(envelopes[4]["id"], 3);
     assert_eq!(envelopes[5]["response"]["result"]["method"], "shutdown");
 }
@@ -88,6 +89,49 @@ fn query_before_initialize_is_a_structured_error() {
     ]);
     assert_eq!(output[0]["id"], 1);
     assert_eq!(output[0]["response"]["error"]["code"], "not_initialized");
+}
+
+#[test]
+fn query_error_includes_recovery_views() {
+    let root = TempDir::new().unwrap();
+    std::fs::write(root.path().join("Host.md"), "# Host\n").unwrap();
+    let output = run(&[
+        request(1, "initialize", json!({"vault_root": root.path()})),
+        request(
+            2,
+            "query",
+            json!({
+                "source": {
+                    "kind": "inline",
+                    "text": "views:\n  - type: table\n    name: Current\n    order: []\n"
+                },
+                "host_path": "Host.md",
+                "view_name": "Removed"
+            }),
+        ),
+        request(3, "shutdown", json!({})),
+    ]);
+    assert_eq!(output[1]["response"]["error"]["code"], "unknown_view");
+    assert_eq!(
+        output[1]["response"]["error"]["available_views"],
+        json!([{"name": "Current", "type": "table"}])
+    );
+}
+
+#[test]
+fn rejects_zero_limit_overrides() {
+    let root = TempDir::new().unwrap();
+    std::fs::write(root.path().join("Host.md"), "# Host\n").unwrap();
+    let output = run(&[
+        request(
+            1,
+            "initialize",
+            json!({"vault_root": root.path(), "limits": {"source_bytes": 0}}),
+        ),
+        request(2, "shutdown", json!({})),
+    ]);
+    assert_eq!(output[0]["id"], 0);
+    assert_eq!(output[0]["response"]["error"]["code"], "invalid_request");
 }
 
 fn run(requests: &[Value]) -> Vec<Value> {

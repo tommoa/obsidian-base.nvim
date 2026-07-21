@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, num::NonZeroUsize, path::Path};
 
 use obsidian_base_worker::{
     WorkerService,
@@ -111,7 +111,7 @@ fn rejects_vault_text_larger_than_the_configured_limit() {
             vault_root: root.path().to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {
-                source_bytes: Some(64),
+                source_bytes: Some(NonZeroUsize::new(64).unwrap()),
                 ..LimitsPatch::default()
             },
         })
@@ -129,7 +129,7 @@ fn rejects_existing_overlays_when_the_limit_is_lowered() {
             vault_root: root.path().to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {
-                source_bytes: Some(128),
+                source_bytes: Some(NonZeroUsize::new(128).unwrap()),
                 ..LimitsPatch::default()
             },
         })
@@ -145,7 +145,7 @@ fn rejects_existing_overlays_when_the_limit_is_lowered() {
             vault_root: root.path().to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {
-                source_bytes: Some(64),
+                source_bytes: Some(NonZeroUsize::new(64).unwrap()),
                 ..LimitsPatch::default()
             },
         })

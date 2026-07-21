@@ -77,35 +77,32 @@ pub fn execute(
 ) -> Result<QueryOutput> {
     let base = crate::yaml::parse_mapping(&input.text, limits)?;
     let views = object_list(base.get("views"));
-    let view = match input.view_name.as_deref() {
-        Some(name) => views
-            .iter()
-            .find(|view| string(view.get("name")) == Some(name))
-            .copied()
-            .ok_or_else(|| WorkerError::new("unknown_view", format!("view not found: {name}")))?,
-        None => views.first().copied().ok_or_else(|| {
-            WorkerError::new("unsupported_view", "only table views are supported")
-        })?,
-    };
-    if string(view.get("type")) != Some("table") {
-        return Err(WorkerError::new(
-            "unsupported_view",
-            "only table views are supported",
-        ));
-    }
-    if ["groupBy", "summaries", "layout"]
+    let renderable_views = views
         .iter()
-        .any(|key| view.contains_key(*key))
-    {
-        return Err(WorkerError::new(
-            "unsupported_view",
-            "grouping, summaries, and non-table layouts are not supported",
-        ));
-    }
+        .copied()
+        .filter(|view| renderable_table_view(view))
+        .collect::<Vec<_>>();
+    let available_views = table_views(&renderable_views);
+    let recover = |error: WorkerError| with_recovery_views(error, &available_views, limits);
+    let view = (match input.view_name.as_deref() {
+        Some(name) => renderable_views
+            .iter()
+            .find(|view| named_view(view) == Some(name))
+            .copied()
+            .ok_or_else(|| WorkerError::new("unknown_view", format!("view not found: {name}"))),
+        None => renderable_views
+            .first()
+            .copied()
+            .ok_or_else(|| WorkerError::new("unsupported_view", "only table views are supported")),
+    })
+    .map_err(recover)?;
     if !index.records.contains_key(&input.host_path) {
-        return Err(WorkerError::new("missing_host", "host note is not indexed"));
+        return Err(recover(WorkerError::new(
+            "missing_host",
+            "host note is not indexed",
+        )));
     }
-    let formulas = parse_formulas(base.get("formulas"), limits)?;
+    let formulas = parse_formulas(base.get("formulas"), limits).map_err(recover)?;
     let mut budget = Budget::new(limits);
     let mut contexts: HashMap<String, EvalContext> = HashMap::new();
     let predicates = [base.get("filters"), view.get("filters")]
@@ -125,7 +122,10 @@ pub fn execute(
             .or_insert_with(|| EvalContext::new(&record.path, &input.host_path));
         let mut include = true;
         for predicate in &predicates {
-            if !evaluator.matches(predicate, context, &mut budget)? {
+            if !evaluator
+                .matches(predicate, context, &mut budget)
+                .map_err(recover)?
+            {
                 include = false;
                 break;
             }
@@ -134,7 +134,7 @@ pub fn execute(
             matched.push(record.path.clone());
         }
     }
-    let sort_rules = parse_sort(view.get("sort"), limits)?;
+    let sort_rules = parse_sort(view.get("sort"), limits).map_err(recover)?;
     if sort_rules.is_empty() {
         // Natural ordering is observable even without explicit sort rules.
         matched.sort_by(|left, right| natural_cmp(left, right));
@@ -147,7 +147,8 @@ pub fn execute(
             let keys = sort_rules
                 .iter()
                 .map(|rule| evaluator.evaluate(&rule.expression, context, &mut budget))
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()
+                .map_err(recover)?;
             sort_keys.insert(path.clone(), keys);
         }
         matched.sort_by(|left, right| {
@@ -167,8 +168,9 @@ pub fn execute(
             natural_cmp(left, right)
         });
     }
-    let columns = parse_columns(view.get("order"), base.get("properties"), limits)?;
-    let view_limit = parse_view_limit(view.get("limit"), limits.result_rows)?;
+    let columns =
+        parse_columns(view.get("order"), base.get("properties"), limits).map_err(recover)?;
+    let view_limit = parse_view_limit(view.get("limit"), limits.result_rows).map_err(recover)?;
     let visible = matched.iter().take(view_limit).cloned().collect::<Vec<_>>();
     let preview_count = input.preview_rows.min(visible.len());
     // Result IDs are generation-scoped so a reindex invalidates every cached row set at once.
@@ -187,7 +189,8 @@ pub fn execute(
                     .evaluate(&column.expression, context, &mut budget)
                     .map(cell)
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+            .map_err(recover)?;
         rendered_rows.push(ResultRow {
             path: path.clone(),
             display_name: record.name.clone(),
@@ -205,9 +208,10 @@ pub fn execute(
         result_id: result_id.clone(),
         source_id: input.source_id,
         view: View {
-            name: string(view.get("name")).unwrap_or("table").to_owned(),
+            name: named_view(view).unwrap_or("table").to_owned(),
             kind: "table",
         },
+        available_views: available_views.clone(),
         columns: public_columns,
         preview_rows: rendered_rows[..preview_count].to_vec(),
         matched_count: matched.len(),
@@ -218,18 +222,75 @@ pub fn execute(
         timings: BTreeMap::new(),
         index_generation: generation,
     };
-    assert_size(&result, limits)?;
+    assert_size(&result, limits).map_err(recover)?;
     assert_size(
         &RowsForLimit {
             result_id: &result_id,
             rows: &rendered_rows,
         },
         limits,
-    )?;
+    )
+    .map_err(recover)?;
     Ok(QueryOutput {
         result,
         rows: rendered_rows,
     })
+}
+
+/// Return whether a view can be rendered by the current table-only UI.
+fn renderable_table_view(view: &BTreeMap<String, DataValue>) -> bool {
+    string(view.get("type")) == Some("table")
+        && !["groupBy", "summaries", "layout"]
+            .iter()
+            .any(|key| view.contains_key(*key))
+}
+
+/// Return the non-empty name that makes a view explicitly selectable.
+fn named_view(view: &BTreeMap<String, DataValue>) -> Option<&str> {
+    string(view.get("name")).filter(|name| !name.is_empty())
+}
+
+/// Return the ordered, unique table views that the client can select.
+fn table_views(views: &[&BTreeMap<String, DataValue>]) -> Vec<View> {
+    let mut names = std::collections::BTreeSet::new();
+    views
+        .iter()
+        .filter_map(|view| named_view(view))
+        .filter(|name| names.insert((*name).to_owned()))
+        .map(|name| View {
+            name: name.to_owned(),
+            kind: "table",
+        })
+        .collect()
+}
+
+/// Attach recovery views only when the complete error data fits the result-byte limit.
+fn with_recovery_views(
+    error: WorkerError,
+    available_views: &[View],
+    limits: Limits,
+) -> WorkerError {
+    let fits = assert_size(
+        &ErrorWithViewsForLimit {
+            code: error.code,
+            message: &error.message,
+            available_views,
+        },
+        limits,
+    )
+    .is_ok();
+    if fits {
+        error.with_available_views(available_views.to_vec())
+    } else {
+        error
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorWithViewsForLimit<'a> {
+    code: &'a str,
+    message: &'a str,
+    available_views: &'a [View],
 }
 
 #[derive(Serialize)]

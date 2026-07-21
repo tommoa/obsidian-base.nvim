@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    num::{NonZeroU64, NonZeroUsize},
     time::{Duration, Instant},
 };
 
@@ -28,8 +29,8 @@ fn indexes_and_queries_five_thousand_files_within_thirty_seconds() {
             vault_root: root.path().to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {
-                query_ms: Some(10_000),
-                result_rows: Some(10_000),
+                query_ms: Some(NonZeroU64::new(10_000).unwrap()),
+                result_rows: Some(NonZeroUsize::new(10_000).unwrap()),
                 ..LimitsPatch::default()
             },
         })

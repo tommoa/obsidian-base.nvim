@@ -1,7 +1,8 @@
 //! Error values and protocol-safe error payloads produced by the worker.
 
-use serde::Serialize;
 use thiserror::Error;
+
+use crate::protocol::View;
 
 /// Standard result type used by worker operations.
 pub type Result<T> = std::result::Result<T, WorkerError>;
@@ -14,6 +15,8 @@ pub struct WorkerError {
     pub code: &'static str,
     /// Contextual message intended for users and diagnostics.
     pub message: String,
+    /// Named views available for recovery from a failed query.
+    pub available_views: Option<Vec<View>>,
 }
 
 impl WorkerError {
@@ -21,7 +24,14 @@ impl WorkerError {
         Self {
             code,
             message: message.into(),
+            available_views: None,
         }
+    }
+
+    /// Attach the view catalog parsed from the same query source.
+    pub fn with_available_views(mut self, available_views: Vec<View>) -> Self {
+        self.available_views = Some(available_views);
+        self
     }
 
     pub fn io(error: std::io::Error) -> Self {
@@ -40,22 +50,6 @@ impl WorkerError {
     pub fn json(error: serde_json::Error) -> Self {
         Self::new("invalid_json", error.to_string())
     }
-
-    pub fn payload(&self) -> ErrorPayload<'_> {
-        ErrorPayload {
-            code: self.code,
-            message: &self.message,
-        }
-    }
-}
-
-#[derive(Serialize)]
-/// Borrowed representation of an error for JSON protocol responses.
-pub struct ErrorPayload<'a> {
-    /// Stable machine-readable code borrowed from the source error.
-    pub code: &'a str,
-    /// Human-readable message borrowed from the source error.
-    pub message: &'a str,
 }
 
 impl From<std::io::Error> for WorkerError {

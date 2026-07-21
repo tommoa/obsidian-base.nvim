@@ -3,7 +3,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,15 +12,23 @@ use crate::{
     limits::Limits,
     path::{canonical_contained, relative_vault_path},
     protocol::{
-        Event, FetchRowsParams, FetchRowsResult, GenerationResult, InitializeParams,
-        InitializeResult, InspectResult, OverlayPathParams, OverlayUpsertParams, QueryParams,
-        QuerySource, Success,
+        FetchRowsParams, FetchRowsResult, GenerationResult, InitializeParams, InitializeResult,
+        InspectResult, OverlayPathParams, OverlayUpsertParams, QueryParams, QuerySource, Success,
     },
     query::{QueryInput, ResultRow, execute},
 };
 
-/// Publishes asynchronous worker events after a successful state transition.
-type Emitter = Arc<dyn Fn(Event) + Send + Sync>;
+/// One published index generation, retained internally until the actor emits it.
+pub struct IndexChange {
+    pub generation: u64,
+    pub paths: Vec<String>,
+}
+
+/// A decoded request result with its optional index transition.
+pub struct HandledRequest {
+    pub success: Success,
+    pub index_change: Option<IndexChange>,
+}
 
 /// All state that is valid only after a vault has been initialized.
 struct InitializedService {
@@ -65,7 +72,6 @@ impl InitializedService {
 /// Owns an optional initialized vault and its result cache.
 pub struct WorkerService {
     state: Option<InitializedService>,
-    emit: Emitter,
 }
 
 impl Default for WorkerService {
@@ -75,47 +81,58 @@ impl Default for WorkerService {
 }
 
 impl WorkerService {
-    /// Create an uninitialized worker that discards asynchronous events.
+    /// Create an uninitialized worker.
     pub fn new() -> Self {
-        Self::with_emitter(|_| {})
-    }
-
-    /// Create an uninitialized worker that publishes events to `emit`.
-    pub fn with_emitter(emit: impl Fn(Event) + Send + Sync + 'static) -> Self {
-        Self {
-            state: None,
-            emit: Arc::new(emit),
-        }
+        Self { state: None }
     }
 
     /// Dispatch a decoded command. Only this boundary can observe an uninitialized service.
     /// Apply one typed request and return its typed success payload.
     ///
     /// `Shutdown` returns its acknowledgement; the actor owns process termination.
-    pub fn handle(&mut self, request: crate::protocol::Request) -> Result<Option<Success>> {
-        let response = match request {
+    pub fn handle(&mut self, request: crate::protocol::Request) -> Result<HandledRequest> {
+        let (success, index_change) = match request {
             crate::protocol::Request::Initialize(params) => {
-                Success::Initialize(self.initialize(params)?)
+                (Success::Initialize(self.initialize(params)?), None)
             }
-            crate::protocol::Request::Query(params) => Success::Query(self.query(params)?),
+            crate::protocol::Request::Query(params) => (Success::Query(self.query(params)?), None),
             crate::protocol::Request::FetchRows(params) => {
-                Success::FetchRows(self.fetch_rows(params)?)
+                (Success::FetchRows(self.fetch_rows(params)?), None)
             }
             crate::protocol::Request::OverlayUpsert(params) => {
-                Success::OverlayUpsert(self.overlay_upsert(params)?)
+                let change = self.overlay_upsert(params)?;
+                (
+                    Success::OverlayUpsert(GenerationResult {
+                        generation: change.generation,
+                    }),
+                    Some(change),
+                )
             }
             crate::protocol::Request::OverlayCommit(params) => {
-                Success::OverlayCommit(self.overlay_remove(params)?)
+                let change = self.overlay_remove(params)?;
+                (
+                    Success::OverlayCommit(GenerationResult {
+                        generation: change.generation,
+                    }),
+                    Some(change),
+                )
             }
             crate::protocol::Request::OverlayRemove(params) => {
-                Success::OverlayRemove(self.overlay_remove(params)?)
+                let change = self.overlay_remove(params)?;
+                (
+                    Success::OverlayRemove(GenerationResult {
+                        generation: change.generation,
+                    }),
+                    Some(change),
+                )
             }
-            crate::protocol::Request::Inspect(_) => Success::Inspect(self.inspect()),
-            crate::protocol::Request::Shutdown(_) => {
-                return Ok(Some(Success::Shutdown(Default::default())));
-            }
+            crate::protocol::Request::Inspect(_) => (Success::Inspect(self.inspect()), None),
+            crate::protocol::Request::Shutdown(_) => (Success::Shutdown(Default::default()), None),
         };
-        Ok(Some(response))
+        Ok(HandledRequest {
+            success,
+            index_change,
+        })
     }
 
     /// Build and publish a new vault snapshot from typed initialization inputs.
@@ -220,7 +237,7 @@ impl WorkerService {
     }
 
     /// Replace one unsaved buffer overlay and publish a new index generation.
-    pub fn overlay_upsert(&mut self, params: OverlayUpsertParams) -> Result<GenerationResult> {
+    pub fn overlay_upsert(&mut self, params: OverlayUpsertParams) -> Result<IndexChange> {
         let path = relative_vault_path(&params.path)?;
         let generation = {
             let state = self.initialized_mut()?;
@@ -241,12 +258,14 @@ impl WorkerService {
             state.publish(index);
             state.generation
         };
-        self.emit_changed(vec![path]);
-        Ok(GenerationResult { generation })
+        Ok(IndexChange {
+            generation,
+            paths: vec![path],
+        })
     }
 
     /// Remove one overlay and publish a new index generation.
-    pub fn overlay_remove(&mut self, params: OverlayPathParams) -> Result<GenerationResult> {
+    pub fn overlay_remove(&mut self, params: OverlayPathParams) -> Result<IndexChange> {
         let path = relative_vault_path(&params.path)?;
         let generation = {
             let state = self.initialized_mut()?;
@@ -257,17 +276,21 @@ impl WorkerService {
             state.publish(index);
             state.generation
         };
-        self.emit_changed(vec![path]);
-        Ok(GenerationResult { generation })
+        Ok(IndexChange {
+            generation,
+            paths: vec![path],
+        })
     }
 
     /// Rebuild after coalesced external filesystem notifications.
-    pub fn reindex_external(&mut self, paths: Vec<String>) -> Result<()> {
+    pub fn reindex_external(&mut self, paths: Vec<String>) -> Result<IndexChange> {
         let state = self.initialized_mut()?;
         let index = state.build(&state.overlays)?;
         state.publish(index);
-        self.emit_changed(paths);
-        Ok(())
+        Ok(IndexChange {
+            generation: state.generation,
+            paths,
+        })
     }
 
     /// Return a serializable worker diagnostic snapshot.
@@ -323,14 +346,6 @@ impl WorkerService {
         self.state
             .as_ref()
             .ok_or_else(|| WorkerError::new("not_initialized", "worker is not initialized"))
-    }
-
-    fn emit_changed(&self, paths: Vec<String>) {
-        let generation = match &self.state {
-            None => return,
-            Some(state) => state.generation,
-        };
-        (self.emit)(Event::IndexChanged { generation, paths });
     }
 }
 

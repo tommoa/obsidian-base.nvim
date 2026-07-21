@@ -42,7 +42,7 @@ function M.select_view(bufnr, source_id)
     if source_id and id ~= source_id then return end
     local views = coordinator.views(bufnr, id)
     if #views == 0 then
-      warn("Base has no named views")
+      warn("Base view metadata is not ready")
       return
     end
     local choices = vim.tbl_map(function(view)

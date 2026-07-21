@@ -1,15 +1,15 @@
 use std::{
     collections::BTreeMap,
     fs,
+    num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
 };
 
 use obsidian_base_worker::{
     WorkerService,
     protocol::{
-        Event, FetchRowsParams, InitializeParams, LimitsPatch, OverlayPathParams,
-        OverlayUpsertParams, QueryParams, QuerySource,
+        FetchRowsParams, InitializeParams, LimitsPatch, OverlayPathParams, OverlayUpsertParams,
+        QueryParams, QuerySource,
     },
 };
 
@@ -17,13 +17,8 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures")
 }
 
-fn initialized(events: Option<Arc<Mutex<Vec<Event>>>>) -> WorkerService {
-    let mut service = match events {
-        Some(events) => {
-            WorkerService::with_emitter(move |event| events.lock().unwrap().push(event))
-        }
-        None => WorkerService::new(),
-    };
+fn initialized() -> WorkerService {
+    let mut service = WorkerService::new();
     let manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(fixtures().join("manifest.json")).unwrap())
             .unwrap();
@@ -76,14 +71,21 @@ fn paths(result: &obsidian_base_worker::protocol::QueryResult) -> Vec<&str> {
 
 #[test]
 fn fixture_views_match_the_reference_results() {
-    let mut service = initialized(None);
+    let mut service = initialized();
+    let personal = service
+        .query(inline_query(&inline_base(2), "Personal"))
+        .unwrap();
     assert_eq!(
-        paths(
-            &service
-                .query(inline_query(&inline_base(2), "Personal"))
-                .unwrap()
-        ),
+        paths(&personal),
         ["Encounters/general note.md", "Activities/Clean kitchen.md"]
+    );
+    assert_eq!(
+        personal
+            .available_views
+            .iter()
+            .map(|view| view.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Personal", "Work"]
     );
     let activity = service
         .query(inline_query(&inline_base(1), "Activity tracker"))
@@ -111,9 +113,131 @@ fn fixture_views_match_the_reference_results() {
 }
 
 #[test]
+fn view_catalog_keeps_named_table_views_once_in_source_order() {
+    let mut service = initialized();
+    let source = "views:\n  - type: list\n    name: Unsupported\n  - type: table\n    name: Grouped\n    groupBy: property.group\n    order: []\n  - type: table\n    name: First\n    order: []\n  - type: table\n    name: First\n    order: []\n  - type: table\n    name: Second\n    order: []\n";
+    let result = service
+        .query(QueryParams {
+            source: QuerySource::Inline {
+                text: source.to_owned(),
+                source_id: Some("fixture".to_owned()),
+            },
+            host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
+            view_name: None,
+            preview_rows: 20,
+        })
+        .unwrap();
+    assert_eq!(result.view.name, "First");
+    assert_eq!(
+        result
+            .available_views
+            .iter()
+            .map(|view| view.name.as_str())
+            .collect::<Vec<_>>(),
+        ["First", "Second"]
+    );
+}
+
+#[test]
+fn unnamed_table_view_is_renderable_but_not_selectable() {
+    let mut service = initialized();
+    let source =
+        "views:\n  - type: table\n    order: []\n  - type: table\n    name: Named\n    order: []\n";
+    let result = service
+        .query(QueryParams {
+            source: QuerySource::Inline {
+                text: source.to_owned(),
+                source_id: Some("fixture".to_owned()),
+            },
+            host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
+            view_name: None,
+            preview_rows: 20,
+        })
+        .unwrap();
+    assert_eq!(result.view.name, "table");
+    assert_eq!(
+        result
+            .available_views
+            .iter()
+            .map(|view| view.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Named"]
+    );
+}
+
+#[test]
+fn empty_table_view_name_is_normalized_as_unnamed() {
+    let mut service = initialized();
+    let source = "views:\n  - type: table\n    name: \"\"\n    order: []\n  - type: table\n    name: Named\n    order: []\n";
+    let result = service
+        .query(QueryParams {
+            source: QuerySource::Inline {
+                text: source.to_owned(),
+                source_id: Some("fixture".to_owned()),
+            },
+            host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
+            view_name: None,
+            preview_rows: 20,
+        })
+        .unwrap();
+    assert_eq!(result.view.name, "table");
+    assert_eq!(
+        result
+            .available_views
+            .iter()
+            .map(|view| view.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Named"]
+    );
+    assert_eq!(
+        service.query(inline_query(source, "")).unwrap_err().code,
+        "unknown_view"
+    );
+}
+
+#[test]
+fn query_errors_preserve_the_current_view_catalog() {
+    let mut service = initialized();
+    let source = "views:\n  - type: table\n    name: Current\n    order: []\n  - type: table\n    name: Other\n    order: []\n";
+    let error = service.query(inline_query(source, "Removed")).unwrap_err();
+    assert_eq!(error.code, "unknown_view");
+    assert_eq!(
+        error
+            .available_views
+            .unwrap()
+            .iter()
+            .map(|view| view.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Current", "Other"]
+    );
+}
+
+#[test]
+fn oversized_query_error_catalog_is_omitted() {
+    let mut service = WorkerService::new();
+    service
+        .initialize(InitializeParams {
+            vault_root: fixtures().join("vault").to_string_lossy().into_owned(),
+            metadata_overrides: BTreeMap::new(),
+            limits: LimitsPatch {
+                result_bytes: Some(NonZeroUsize::new(100).unwrap()),
+                ..LimitsPatch::default()
+            },
+        })
+        .unwrap();
+    let views = (0..100)
+        .map(|index| format!("  - type: table\n    name: View {index}\n    order: []\n"))
+        .collect::<String>();
+    let error = service
+        .query(inline_query(&format!("views:\n{views}"), "Removed"))
+        .unwrap_err();
+    assert_eq!(error.code, "unknown_view");
+    assert!(error.available_views.is_none());
+}
+
+#[test]
 fn overlays_emit_and_invalidate_cached_results() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let mut service = initialized(Some(events.clone()));
+    let mut service = initialized();
     let before = service
         .query(inline_query(&inline_base(2), "Work"))
         .unwrap();
@@ -125,13 +249,15 @@ fn overlays_emit_and_invalidate_cached_results() {
             })
             .is_ok()
     );
-    service
+    let change = service
         .overlay_upsert(OverlayUpsertParams {
             path: "Activities/Clean kitchen.md".to_owned(),
             contents: fs::read_to_string(fixtures().join("overlays/Clean kitchen.work.md"))
                 .unwrap(),
         })
         .unwrap();
+    assert_eq!(change.generation, 2);
+    assert_eq!(change.paths, ["Activities/Clean kitchen.md"]);
     assert_eq!(
         service
             .fetch_rows(FetchRowsParams { result_id })
@@ -143,15 +269,11 @@ fn overlays_emit_and_invalidate_cached_results() {
         .query(inline_query(&inline_base(2), "Work"))
         .unwrap();
     assert!(paths(&work).contains(&"Activities/Clean kitchen.md"));
-    assert!(matches!(
-        events.lock().unwrap().as_slice(),
-        [Event::IndexChanged { generation: 2, paths }] if paths == &["Activities/Clean kitchen.md"]
-    ));
 }
 
 #[test]
 fn overlay_only_host_and_formula_cache_work() {
-    let mut service = initialized(None);
+    let mut service = initialized();
     service
         .overlay_upsert(OverlayUpsertParams {
             path: "Draft.md".to_owned(),
@@ -186,8 +308,8 @@ fn query_wide_limits_and_result_bytes_are_enforced() {
             vault_root: fixtures().join("vault").to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {
-                evaluation_steps: Some(4),
-                result_bytes: Some(100_000),
+                evaluation_steps: Some(NonZeroU64::new(4).unwrap()),
+                result_bytes: Some(NonZeroUsize::new(100_000).unwrap()),
                 ..LimitsPatch::default()
             },
         })
@@ -201,7 +323,7 @@ fn query_wide_limits_and_result_bytes_are_enforced() {
         "evaluation_limit"
     );
 
-    let mut service = initialized(None);
+    let mut service = initialized();
     let invalid = "views:\n  - type: table\n    name: Table\n    limit: -1\n    order: []\n";
     assert_eq!(
         service
@@ -214,7 +336,7 @@ fn query_wide_limits_and_result_bytes_are_enforced() {
 
 #[test]
 fn result_ids_follow_the_query_allocation_boundary() {
-    let mut service = initialized(None);
+    let mut service = initialized();
     let source = inline_base(2);
     let mut invalid = inline_query(&source, "Missing");
     invalid.source = QuerySource::Inline {
@@ -230,7 +352,7 @@ fn result_ids_follow_the_query_allocation_boundary() {
         "r1-1"
     );
 
-    let mut service = initialized(None);
+    let mut service = initialized();
     let cycle = "formulas:\n  a: formula.b\n  b: formula.a\nviews:\n  - type: table\n    name: Table\n    order: [formula.a]\n";
     let mut cyclic = inline_query(cycle, "Table");
     cyclic.source = QuerySource::Inline {

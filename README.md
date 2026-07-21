@@ -38,6 +38,10 @@ Queries run in the native `obsidian-base-worker` process. Startup never
 downloads or builds it: install a release binary explicitly, point the plugin
 at a packaged binary, or build it from source.
 
+Editing a buffer does not automatically refresh Base previews. Save the buffer
+or run `:Obsidian bases refresh`; an explicit refresh evaluates the buffer's
+current unsaved text through the worker overlay.
+
 ## Installation
 
 With lazy.nvim:

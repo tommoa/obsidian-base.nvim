@@ -30,8 +30,8 @@ local augroup = vim.api.nvim_create_augroup("obsidian-base", { clear = true })
 ---@field end_is_eof? boolean
 ---@field path? string
 ---@field text string
----@field views table[]
 ---@field selected_view? string
+---@field available_views? ObsidianBasesTableView[]
 ---@field vault_name string
 ---@field loading boolean
 ---@field error? ObsidianBasesProtocolError
@@ -64,7 +64,6 @@ local augroup = vim.api.nvim_create_augroup("obsidian-base", { clear = true })
 ---@field generation integer
 ---@field sources ObsidianBasesSource[]
 ---@field code_action_row? integer
----@field timer? uv.uv_timer_t
 
 ---Find the canonical vault root containing a filesystem path.
 ---@param path string
@@ -164,15 +163,13 @@ end
 ---@param workspace ObsidianBasesWorkspace
 ---@param path string
 ---@param contents string
----@param callback fun(error: ObsidianBasesProtocolError?)
+---@param callback fun(error: ObsidianBasesProtocolError?, changed: boolean)
 local function upsert_overlay(workspace, path, contents, callback)
-    if workspace.overlays[path] == contents then callback(nil); return end
-    -- Record the desired contents before the asynchronous request. A later
-    -- detach can then clear the path without an older callback resurrecting it.
+    if workspace.overlays[path] == contents then callback(nil, false); return end
     workspace.overlays[path] = contents
     send(workspace, "overlay_upsert", { path = path, contents = contents }, function(error)
         if error and workspace.overlays[path] == contents then workspace.overlays[path] = nil end
-        callback(error)
+        callback(error, error == nil)
     end)
 end
 
@@ -210,22 +207,30 @@ local function on_envelope(workspace, line)
         workspace.generation = envelope.event.generation
         workspace.results = {}
         redraw_workspace(workspace)
-        for bufnr in pairs(workspace.buffers) do vim.schedule(function() M.refresh(bufnr) end) end
+        for bufnr in pairs(workspace.buffers) do
+            local buffer = buffers[bufnr]
+            local local_overlay = envelope.event.origin == "overlay" and buffer
+                and vim.tbl_contains(envelope.event.paths, buffer.path)
+            if not local_overlay then
+                local target = bufnr
+                vim.schedule(function() M.refresh(target) end)
+            end
+        end
         notify_index_changed(workspace, envelope.event)
         return
     end
     local pending = workspace.pending[envelope.id]
-    if pending then
-        workspace.pending[envelope.id] = nil
-        local response = envelope.response
-        if response.type == "success" and response.result.method ~= pending.method then
-            workspace.error = "worker response method does not match request"
-            stop_workspace(workspace)
-            return
-        end
-        pending.callback(response.type == "error" and response.error or nil,
-            response.type == "success" and response.result.data or nil)
+    if not pending then
+        fail_workspace(workspace, { code = "protocol", message = "worker responded to an unknown request" })
+        return
     end
+    workspace.pending[envelope.id] = nil
+    local result, decode_error = contract.decode_response(envelope, pending.method)
+    if decode_error and decode_error.code == "protocol" then
+        fail_workspace(workspace, decode_error)
+        return
+    end
+    pending.callback(decode_error, result)
 end
 
 ---Return the vault's worker workspace, creating and initialising it when needed.
@@ -351,45 +356,6 @@ local function restart_workspace(workspace)
     return replacement
 end
 
----Extract lightweight named-view metadata for the UI before the worker parses the Base.
----@param source ObsidianBasesSource
----@return table[]
-local function source_views(source)
-    -- View choice only needs names. Keep this lightweight and independent from
-    -- optional Lua YAML bindings; the worker remains the authoritative parser.
-    local views = {}
-    local in_views, current = false, nil
-    ---Unquote the small scalar subset used for view names and types.
-    ---@param value? string
-    ---@return string
-    local function scalar(value)
-        value = vim.trim(value or "")
-        return (value:gsub("^['\"](.-)['\"]$", "%1"))
-    end
-    for _, line in ipairs(vim.split(source.text or "", "\n", { plain = true })) do
-        if line:match("^views:%s*$") then
-            in_views = true
-        elseif in_views then
-            local indent = #(line:match("^%s*") or "")
-            if line:match("%S") and indent == 0 then break end
-            local name = line:match("^%s*%-%s*name:%s*(.-)%s*$")
-            if line:match("^%s*%-%s*") then
-                current = {}
-                views[#views + 1] = current
-                if name then current.name = scalar(name) end
-                local type_name = line:match("^%s*%-%s*type:%s*(.-)%s*$")
-                if type_name then current.type = scalar(type_name) end
-            elseif current then
-                name = line:match("^%s*name:%s*(.-)%s*$")
-                local type_name = line:match("^%s*type:%s*(.-)%s*$")
-                if name then current.name = scalar(name) end
-                if type_name then current.type = scalar(type_name) end
-            end
-        end
-    end
-    return vim.tbl_filter(function(view) return view.name and view.name ~= "" end, views)
-end
-
 ---Discover `base` fenced blocks and preserve extmarks for unchanged sources.
 ---@param bufnr integer
 ---@param root string
@@ -434,7 +400,6 @@ local function fenced_sources(bufnr, root, path, previous)
                         }
                     end
                     source.text = table.concat(vim.api.nvim_buf_get_lines(bufnr, start + 1, finish - 1, false), "\n")
-                    source.views = source_views(source)
                     source.vault_name, source.loading, source.error, source.result = vim.fs.basename(root), true, nil,
                         nil
                     sources[#sources + 1] = source
@@ -466,7 +431,6 @@ local function discover(buffer)
             }
         end
         source.text = table.concat(vim.api.nvim_buf_get_lines(buffer.bufnr, 0, -1, false), "\n")
-        source.views = source_views(source)
         source.vault_name, source.loading, source.error, source.result = vim.fs.basename(buffer.root), true, nil, nil
         return { source }
     end
@@ -543,7 +507,12 @@ local function overlay_then_query(buffer, generation)
                     if not target or current.generation ~= generation then return end
                     target.loading = false
                     target.error, target.result = query_error, result
-                    if result then workspace.results[result.result_id] = result end
+                    if result then
+                        target.available_views = result.available_views
+                        workspace.results[result.result_id] = result
+                    elseif query_error and query_error.available_views ~= nil then
+                        target.available_views = query_error.available_views
+                    end
                     presenter.sync_buffer(buffer.bufnr)
                 end)
             end
@@ -592,8 +561,16 @@ function M.query_embed(request, callback)
         end
         if vim.api.nvim_buf_is_valid(request.bufnr) and vim.api.nvim_buf_is_loaded(request.bufnr) then
             upsert_overlay(workspace, host_path,
-                table.concat(vim.api.nvim_buf_get_lines(request.bufnr, 0, -1, false), "\n"), function(error)
-                    if error then if not cancelled then callback(error) end else query() end
+                table.concat(vim.api.nvim_buf_get_lines(request.bufnr, 0, -1, false), "\n"), function(error, changed)
+                    if error then
+                        if not cancelled then callback(error) end
+                    else
+                        local buffer = buffers[request.bufnr]
+                        if changed and buffer and buffer.workspace == workspace and buffer.path == host_path then
+                            M.refresh(request.bufnr)
+                        end
+                        query()
+                    end
                 end)
         else
             query()
@@ -643,11 +620,6 @@ end
 ---@param buffer ObsidianBasesBuffer
 local function detach_buffer(buffer)
     local workspace, path = buffer.workspace, buffer.path
-    if buffer.timer then
-        buffer.timer:stop()
-        if not buffer.timer:is_closing() then buffer.timer:close() end
-        buffer.timer = nil
-    end
     workspace.buffers[buffer.bufnr] = nil
     if path then
         workspace.overlays[path] = nil
@@ -805,7 +777,8 @@ function M.views(bufnr, source_id)
     local buffer = buffers[bufnr]
     local source = buffer and current_source(buffer, source_id)
     if not source then return {} end
-    return vim.tbl_map(function(view) return { name = view.name, type = view.type } end, source.views or {})
+    return vim.tbl_map(function(view) return { name = view.name, type = view.type } end,
+        source.available_views or {})
 end
 
 ---Return the current result view name for a source.
@@ -827,7 +800,9 @@ function M.select_view(bufnr, source_id, view_name)
     local buffer = buffers[bufnr]
     local source = buffer and current_source(buffer, source_id)
     if not source then return false end
-    local present = vim.iter(source.views or {}):any(function(view) return view.name == view_name end)
+    local present = vim.iter(source.available_views or {}):any(function(view)
+        return view.name == view_name
+    end)
     if not present then return false end
     source.selected_view = view_name
     M.refresh(bufnr)
@@ -939,37 +914,19 @@ function M.setup()
         pattern = { "markdown", "obsidian_base" },
         callback = function(args) M.attach(args.buf) end,
     })
-    vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
-        group = augroup,
-        callback = function(args)
-            local buffer = buffers[args.buf]
-            if not buffer then return end
-            if buffer.timer then
-                buffer.timer:stop()
-                if not buffer.timer:is_closing() then buffer.timer:close() end
-            end
-            local timer = vim.uv.new_timer()
-            buffer.timer = timer
-            timer:start(config.get().debounce_ms, 0, vim.schedule_wrap(function()
-                if not timer:is_closing() then
-                    timer:stop()
-                    timer:close()
-                end
-                local current = buffers[args.buf]
-                if current and current.timer == timer then
-                    current.timer = nil
-                    M.refresh(args.buf)
-                end
-            end))
-        end
-    })
     vim.api.nvim_create_autocmd("BufWritePost", {
         group = augroup,
         callback = function(args)
             local buffer = buffers[args.buf]
             if not buffer or not buffer.path or buffer.workspace.status ~= "ready" then return end
-            buffer.workspace.overlays[buffer.path] = nil
-            send(buffer.workspace, "overlay_commit", { path = buffer.path }, function() end)
+            local workspace, path = buffer.workspace, buffer.path
+            workspace.overlays[path] = nil
+            send(workspace, "overlay_commit", { path = path }, function(error)
+                local current = buffers[args.buf]
+                if not error and current and current.workspace == workspace and current.path == path then
+                    M.refresh(args.buf)
+                end
+            end)
         end
     })
     vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {

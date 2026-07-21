@@ -27,15 +27,20 @@ Failures use:
 {"id":1,"response":{"type":"error","error":{"code":"invalid_request","message":"..."}}}
 ```
 
+Query failures that occur after the Base views are parsed also include
+`available_views`, allowing clients to recover from an invalid selected view
+without parsing YAML themselves.
+
 Index changes use:
 
 ```json
-{"event":{"type":"index_changed","generation":2,"paths":["Draft.md"]}}
+{"event":{"type":"index_changed","generation":2,"paths":["Draft.md"],"origin":"overlay"}}
 ```
 
 Every request receives one response, including `shutdown`; the worker exits
 after emitting the shutdown acknowledgement. Successful overlay mutations emit
-`index_changed` before their matching response.
+`index_changed` with `origin: "overlay"` before their matching response.
+Watcher rescans emit the same event with `origin: "watch"`.
 
 ## Methods
 
@@ -43,8 +48,9 @@ after emitting the shutdown acknowledgement. Successful overlay mutations emit
   `{generation,files}`.
 - `query`: `{source,host_path,view_name?,preview_rows?}`. `source` is either
   `{kind:"inline",text,source_id?}` or `{kind:"file",path,source_id?}`.
-  Result is the typed table preview, including `result_id`, columns, preview
-  rows, counts, warnings, timings, and `index_generation`.
+  Result is the typed table preview, including `result_id`, selected `view`,
+  selectable named table `available_views`, columns, preview rows, counts,
+  warnings, timings, and `index_generation`.
 - `fetch_rows`: `{result_id}`. Result: `{result_id,rows}`.
 - `overlay_upsert`: `{path,contents}`. Result: `{generation}`.
 - `overlay_commit` and `overlay_remove`: `{path}`. Result: `{generation}`.
@@ -53,8 +59,9 @@ after emitting the shutdown acknowledgement. Successful overlay mutations emit
 - `shutdown`: `{}`. Result: `{}` before process exit.
 
 `limits` accepts only `source_bytes`, `expression_bytes`, `query_ms`,
-`evaluation_steps`, `result_rows`, and `result_bytes`; each value must be an
-unsigned integer. `preview_rows` is an unsigned integer and defaults to 50.
+`evaluation_steps`, `result_rows`, and `result_bytes`; each supplied value must
+be a positive integer. Omitted limit fields use the worker defaults.
+`preview_rows` is an unsigned integer and defaults to 50.
 
 ## Failures
 
