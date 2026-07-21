@@ -135,16 +135,21 @@ in worker inspection diagnostics.
 
 ## Local Checks
 
+Run the complete automated check set through the pinned flake before pushing:
+
 ```sh
-cargo +1.85 fmt --manifest-path worker/Cargo.toml --check
-cargo +1.85 clippy --manifest-path worker/Cargo.toml --all-targets --locked -- -D warnings
-cargo +1.85 test --manifest-path worker/Cargo.toml --locked
-nix build 'path:.#worker'
-nix flake check 'path:.'
+nix flake check 'path:.' --print-build-logs
 ```
 
-The flake builds and tests the Rust worker, then runs the Lua integration smokes
-against the resulting native executable. The embed smoke remains separate
+This is the canonical check interface for local development, GitHub CI, and
+release preparation. The flake checks formatting and Clippy, builds and tests
+the Rust worker, verifies project metadata and architecture boundaries, and
+runs the Lua integration smokes against the resulting native executable. It
+supplies Rust, Python, Neovim, ripgrep, and the other check dependencies rather
+than inheriting tools from the host environment.
+
+For focused investigation, run individual tools through `nix develop` instead
+of relying on globally installed versions. The embed smoke remains separate
 because it depends on private embed-provider modules.
 
 Maintainers should follow the documented [release procedure](docs/releasing.md)

@@ -9,28 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  rust:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: 1.85.0
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: worker
-      - run: python scripts/metadata-check.py
-      - run: sh scripts/architecture-check.sh "$PWD"
-      - run: cargo fmt --manifest-path worker/Cargo.toml --check
-      - run: cargo clippy --manifest-path worker/Cargo.toml --all-targets --locked -- -D warnings
-      - run: cargo test --manifest-path worker/Cargo.toml --locked
-      - run: cargo build --manifest-path worker/Cargo.toml --release --locked
-
   nix:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
-      - run: nix build 'path:.#worker'
-      - run: nix flake check 'path:.'
+      - run: nix flake check 'path:.' --print-build-logs

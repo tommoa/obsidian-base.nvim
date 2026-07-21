@@ -64,8 +64,31 @@
         let
           pkgs = import nixpkgs { inherit system; };
           worker = self.packages.${system}.worker;
+          worker-quality = pkgs.stdenv.mkDerivation {
+            pname = "obsidian-base-worker-quality";
+            version = worker.version;
+            src = "${self}/worker";
+            cargoDeps = worker.cargoDeps;
+            nativeBuildInputs = [
+              pkgs.cargo
+              pkgs.clippy
+              pkgs.rustc
+              pkgs.rustfmt
+              pkgs.rustPlatform.cargoSetupHook
+            ];
+            buildPhase = ''
+              runHook preBuild
+              cargo fmt --check
+              cargo clippy --all-targets --locked -- -D warnings
+              runHook postBuild
+            '';
+            installPhase = ''
+              touch "$out"
+            '';
+          };
         in
         {
+          inherit worker worker-quality;
           obsidian-base-integration =
             pkgs.runCommand "obsidian-base-integration"
               {

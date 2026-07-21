@@ -7,7 +7,9 @@ then verifies the downloaded binary against that sidecar before installing it.
 
 1. Update the worker version in `worker/Cargo.toml` and `flake.nix`, then commit
    the release preparation.
-2. Tag that commit with the matching version, for example `v0.1.0`, and push the
+2. Run the complete pinned check set from the release commit:
+   `nix flake check 'path:.' --print-build-logs`.
+3. Tag that commit with the matching version, for example `v0.1.0`, and push the
    tag. The **Release** workflow builds and smoke-tests every target, generates
    a `.sha256` sidecar for every staged binary, and publishes both files.
 
