@@ -89,7 +89,7 @@ case "$url" in
   *.sha256*) source=$FAKE_CHECKSUM_SOURCE ;;
   *) source=$FAKE_CURL_SOURCE ;;
 esac
-exec /bin/cp "$source" "$output"
+exec cp "$source" "$output"
 ]]
 local shasum = [[#!/bin/sh
 printf '%s  %s\n' "$FAKE_CHECKSUM" "${3:-${1}}"
