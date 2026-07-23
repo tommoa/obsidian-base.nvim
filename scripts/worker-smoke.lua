@@ -118,10 +118,43 @@ assert(vim.wait(5000, function() return embed_error ~= nil or embed_result ~= ni
   "unchanged embed overlay query timed out")
 assert(not embed_error and coordinator.inspect(daily_bufnr).generation == unchanged_generation,
   "unchanged embed overlay refreshed fenced Base previews")
+local base_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+local previous_base_result_id = coordinator.inspect(bufnr).sources[1].result.result_id
+-- Leave an invalid unsaved Base in the peer buffer. The next daily overlay
+-- event must re-query its last explicit snapshot rather than publishing this.
+vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "views:", "  - type: table", "    filters: [" })
+vim.api.nvim_buf_set_lines(daily_bufnr, -1, -1, false, { "" })
+embed_error, embed_result = nil, nil
+coordinator.query_embed({
+  bufnr = daily_bufnr,
+  workspace_root = vault,
+  host_path = daily,
+  source_path = "Bases/Daily log tasks.base",
+  view_name = "Work",
+}, function(error, result)
+  embed_error, embed_result = error, result
+end)
+assert(vim.wait(5000, function() return embed_error ~= nil or embed_result ~= nil end, 25),
+  "peer-refresh overlay query timed out")
+assert(not embed_error, "peer-refresh overlay query failed: " .. vim.inspect(embed_error))
+assert(vim.wait(5000, function()
+  local current = coordinator.inspect(daily_bufnr)
+  local source = current and current.sources[1]
+  return source and (source.error or (source.result and source.result.result_id ~= previous_result_id))
+end, 25), "peer-refresh overlay did not update fenced Base previews")
+local daily_refreshed = coordinator.inspect(daily_bufnr).sources[1]
+assert(daily_refreshed.result, "peer-refresh overlay query failed: " .. vim.inspect(daily_refreshed.error))
+previous_result_id = daily_refreshed.result.result_id
+assert(vim.wait(5000, function()
+  local current = coordinator.inspect(bufnr)
+  local source = current and current.sources[1]
+  return source and (source.error or (source.result and source.result.result_id ~= previous_base_result_id))
+end, 25), "peer index event did not re-query the cached Base snapshot")
+local peer_refreshed = coordinator.inspect(bufnr).sources[1]
+assert(peer_refreshed.result,
+  "peer index event published the dirty Base buffer: " .. vim.inspect(peer_refreshed.error))
+vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, base_lines)
 vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "" })
-vim.wait(400)
-assert(coordinator.inspect(daily_bufnr).sources[1].result.result_id == previous_result_id,
-  "editing a buffer should not automatically refresh Bases")
 bases.refresh(bufnr)
 assert(vim.wait(5000, function()
   local current = coordinator.inspect(daily_bufnr)

@@ -1,4 +1,5 @@
 .DS_Store
 .opencode
+nvim.log
 result
 target

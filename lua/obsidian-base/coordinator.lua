@@ -14,6 +14,9 @@ local crash_history = {}
 ---@type table<string, table<integer, fun(event: table)>>
 local index_subscribers = {}
 local next_index_subscriber = 1
+-- Defined after source discovery so peer index events can re-query the last
+-- explicit buffer snapshot without uploading current unsaved text.
+local requery_cached_sources
 -- Autocmd callbacks read live configuration, so setup only needs to register them once.
 local configured = false
 -- The source query is static; only Tree-sitter parsing of the current buffer varies.
@@ -211,9 +214,11 @@ local function on_envelope(workspace, line)
             local buffer = buffers[bufnr]
             local local_overlay = envelope.event.origin == "overlay" and buffer
                 and vim.tbl_contains(envelope.event.paths, buffer.path)
-            if not local_overlay then
-                local target = bufnr
-                vim.schedule(function() M.refresh(target) end)
+            if not local_overlay and buffer then
+                -- Index changes invalidate worker result IDs. Re-query the
+                -- last explicit snapshot instead of rediscovering and
+                -- uploading a peer buffer's newer unsaved text.
+                requery_cached_sources(buffer)
             end
         end
         notify_index_changed(workspace, envelope.event)
@@ -479,12 +484,42 @@ local function nearest_heading(buffer, row)
     return "Base"
 end
 
----Synchronise unsaved text to the worker overlay, then query every discovered source.
+---Query every discovered source against the worker's current index.
+---@param buffer ObsidianBasesBuffer
+---@param generation integer
+local function query_sources(buffer, generation)
+    local workspace, path = buffer.workspace, buffer.path
+    if not path then return end
+    for _, source in ipairs(buffer.sources) do
+        local source_id, text = source.id, source.text
+        send(workspace, "query", {
+            source = source.kind == "inline" and { kind = "inline", text = text, source_id = source_id }
+                or { kind = "file", path = source.path, source_id = source_id },
+            host_path = path,
+            preview_rows = config.get().max_preview_rows,
+            view_name = source.selected_view,
+        }, function(query_error, result)
+            local current = buffers[buffer.bufnr]
+            local target = current and current_source(current, source_id)
+            if not target or current.generation ~= generation then return end
+            target.loading = false
+            target.error, target.result = query_error, result
+            if result then
+                target.available_views = result.available_views
+                workspace.results[result.result_id] = result
+            elseif query_error and query_error.available_views ~= nil then
+                target.available_views = query_error.available_views
+            end
+            presenter.sync_buffer(buffer.bufnr)
+        end)
+    end
+end
+
+---Synchronise unsaved text to the worker overlay, then query each source.
 ---@param buffer ObsidianBasesBuffer
 ---@param generation integer
 local function overlay_then_query(buffer, generation)
-    local workspace = buffer.workspace
-    local path = buffer.path
+    local workspace, path = buffer.workspace, buffer.path
     if not path then return end
     upsert_overlay(workspace, path, table.concat(vim.api.nvim_buf_get_lines(buffer.bufnr, 0, -1, false), "\n"),
         function(error)
@@ -493,30 +528,25 @@ local function overlay_then_query(buffer, generation)
                 presenter.sync_buffer(buffer.bufnr)
                 return
             end
-            for _, source in ipairs(buffer.sources) do
-                local source_id, text = source.id, source.text
-                send(workspace, "query", {
-                    source = source.kind == "inline" and { kind = "inline", text = text, source_id = source_id }
-                        or { kind = "file", path = source.path, source_id = source_id },
-                    host_path = path,
-                    preview_rows = config.get().max_preview_rows,
-                    view_name = source.selected_view,
-                }, function(query_error, result)
-                    local current = buffers[buffer.bufnr]
-                    local target = current and current_source(current, source_id)
-                    if not target or current.generation ~= generation then return end
-                    target.loading = false
-                    target.error, target.result = query_error, result
-                    if result then
-                        target.available_views = result.available_views
-                        workspace.results[result.result_id] = result
-                    elseif query_error and query_error.available_views ~= nil then
-                        target.available_views = query_error.available_views
-                    end
-                    presenter.sync_buffer(buffer.bufnr)
-                end)
-            end
+            query_sources(buffer, generation)
         end)
+end
+
+---Re-evaluate the last explicitly synchronized source definitions after a
+---peer index change without publishing edits that have not been refreshed.
+---@param buffer ObsidianBasesBuffer
+requery_cached_sources = function(buffer)
+    if not buffer.enabled or not buffer.path or buffer.workspace.status ~= "ready"
+        or not vim.api.nvim_buf_is_valid(buffer.bufnr)
+    then
+        return
+    end
+    buffer.generation = buffer.generation + 1
+    for _, source in ipairs(buffer.sources) do
+        source.loading, source.error, source.result = true, nil, nil
+    end
+    presenter.sync_buffer(buffer.bufnr)
+    query_sources(buffer, buffer.generation)
 end
 
 ---Evaluate a file Base embedded in a Markdown host without creating a preview.
