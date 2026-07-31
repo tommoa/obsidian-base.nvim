@@ -203,6 +203,47 @@ pub fn format_utc_date(milliseconds: i64) -> String {
         .unwrap_or_default()
 }
 
+/// Round a number to decimal precision using JavaScript `Math.round` tie rules.
+///
+/// Fractional precision is truncated toward zero. Precisions beyond what an
+/// `f64` can scale preserve the closest representable value (or signed zero
+/// for sufficiently large negative precision).
+pub fn round_number(value: f64, digits: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    if !digits.is_finite() {
+        return f64::NAN;
+    }
+    let scale = 10_f64.powf(digits.trunc());
+    if scale.is_infinite() {
+        // The input already carries less precision than the requested scale can express.
+        return value;
+    }
+    if scale == 0.0 {
+        // Preserve JavaScript's observable negative zero when rounding negative values.
+        return 0.0_f64.copysign(value);
+    }
+    let shifted = value * scale;
+    if !shifted.is_finite() {
+        // Scaling overflow cannot change any representable digit in the input.
+        return value;
+    }
+    let lower = shifted.floor();
+    // Exact ties move toward positive infinity, matching `Math.round` for negatives too.
+    let rounded = if shifted - lower < 0.5 {
+        lower
+    } else {
+        lower + 1.0
+    };
+    let rounded = if rounded == 0.0 {
+        0.0_f64.copysign(value)
+    } else {
+        rounded
+    };
+    rounded / scale
+}
+
 pub fn parse_duration(value: &str) -> Option<f64> {
     let value = value.trim();
     let split = value.find(char::is_whitespace)?;
@@ -316,6 +357,16 @@ mod tests {
         );
         assert!(parse_date("July 15 2026").is_none());
         assert!(parse_date("2026-07-15T00:00:00").is_none());
+    }
+
+    #[test]
+    fn rounds_numbers_with_javascript_ties_and_decimal_precision() {
+        assert_eq!(round_number(2.5, 0.0), 3.0);
+        assert_eq!(round_number(-2.5, 0.0), -2.0);
+        assert_eq!(round_number(2.345, 2.0), 2.35);
+        assert_eq!(round_number(123.4, -1.0), 120.0);
+        assert!(round_number(f64::NAN, 0.0).is_nan());
+        assert_eq!(round_number(f64::INFINITY, 2.0), f64::INFINITY);
     }
 
     #[test]

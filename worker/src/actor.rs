@@ -8,6 +8,7 @@ use tokio::{
 };
 
 use crate::{
+    environment::ExecutionEnvironment,
     protocol::{
         ErrorPayload, Event, EventEnvelope, IndexChangeOrigin, Request, RequestId,
         ResponseEnvelope, WorkerEnvelope, decode,
@@ -27,12 +28,22 @@ pub enum ActorMessage {
 }
 
 /// Owns mutable worker state and coordinates request, watcher, and output channels.
+///
+/// Requests and watcher flushes are handled serially, so the contained
+/// [`WorkerService`] never needs its own synchronization. Potentially blocking
+/// service work is moved to Tokio's blocking pool and returned before the next
+/// message is handled.
 pub struct WorkerActor {
     service: WorkerService,
+    /// Sender cloned into the vault watcher so changes re-enter this actor's queue.
     input: mpsc::Sender<ActorMessage>,
+    /// Typed response and event sink; the process boundary performs JSON serialization.
     output: mpsc::UnboundedSender<WorkerEnvelope>,
+    /// Active watcher handle, retained to keep observation of the current vault alive.
     watcher: Option<VaultWatcher>,
+    /// Bounded set of changed paths accumulated during the debounce window.
     pending_paths: BTreeSet<String>,
+    /// Deadline for publishing the next coalesced filesystem rescan.
     deadline: Option<Instant>,
 }
 
@@ -105,7 +116,12 @@ impl WorkerActor {
             Request::OverlayUpsert(_) | Request::OverlayCommit(_) | Request::OverlayRemove(_)
         );
         let result = self
-            .blocking_service(move |service| service.handle(envelope.request))
+            .blocking_service(move |service| {
+                // Time and zone are sampled together inside the request operation so every
+                // time-sensitive action performed by this dispatch shares one snapshot.
+                let environment = ExecutionEnvironment::capture();
+                service.handle(envelope.request, &environment)
+            })
             .await;
         match result {
             Ok(handled) => {

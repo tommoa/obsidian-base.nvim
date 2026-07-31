@@ -1,10 +1,17 @@
 use std::{collections::BTreeMap, fs, num::NonZeroUsize, path::Path};
 
 use obsidian_base_worker::{
-    WorkerService,
+    ExecutionEnvironment, WorkerService,
     protocol::{FetchRowsParams, InitializeParams, LimitsPatch, QueryParams, QuerySource},
 };
 use tempfile::TempDir;
+
+fn environment() -> ExecutionEnvironment {
+    ExecutionEnvironment::new(
+        "2026-07-24T00:00:00Z".parse().unwrap(),
+        jiff::tz::TimeZone::UTC,
+    )
+}
 
 fn host(root: &Path) {
     fs::create_dir_all(root.join(".obsidian")).unwrap();
@@ -47,15 +54,18 @@ fn rejects_symlinked_sources_outside_the_vault() {
     let mut service = WorkerService::new();
     initialize(&mut service, &root);
     let error = service
-        .query(QueryParams {
-            source: QuerySource::File {
-                path: "Escaped.base".to_owned(),
-                source_id: None,
+        .query(
+            QueryParams {
+                source: QuerySource::File {
+                    path: "Escaped.base".to_owned(),
+                    source_id: None,
+                },
+                host_path: "Host.md".to_owned(),
+                view_name: None,
+                preview_rows: 50,
             },
-            host_path: "Host.md".to_owned(),
-            view_name: None,
-            preview_rows: 50,
-        })
+            &environment(),
+        )
         .unwrap_err();
     assert_eq!(error.code, "path_outside_vault");
 }
@@ -68,9 +78,10 @@ fn failed_rescan_preserves_generation_and_cached_rows() {
     let mut service = WorkerService::new();
     initialize(&mut service, root.path());
     let result = service
-        .query(inline_query(
-            "views:\n  - type: table\n    name: Table\n    order: []\n",
-        ))
+        .query(
+            inline_query("views:\n  - type: table\n    name: Table\n    order: []\n"),
+            &environment(),
+        )
         .unwrap();
     let id = result.result_id;
     let before = serde_json::to_value(service.inspect()).unwrap();
@@ -96,7 +107,10 @@ fn rejects_unsafe_yaml_and_deep_filter_trees() {
     initialize(&mut service, root.path());
     let unsafe_source = "filters: &filter file.name\nviews:\n  - type: table\n    filters: *filter\n    order: []\n";
     assert_eq!(
-        service.query(inline_query(unsafe_source)).unwrap_err().code,
+        service
+            .query(inline_query(unsafe_source), &environment())
+            .unwrap_err()
+            .code,
         "unsafe_yaml"
     );
 }
@@ -135,10 +149,13 @@ fn rejects_existing_overlays_when_the_limit_is_lowered() {
         })
         .unwrap();
     service
-        .overlay_upsert(obsidian_base_worker::protocol::OverlayUpsertParams {
-            path: "Draft.md".to_owned(),
-            contents: "x".repeat(65),
-        })
+        .overlay_upsert(
+            obsidian_base_worker::protocol::OverlayUpsertParams {
+                path: "Draft.md".to_owned(),
+                contents: "x".repeat(65),
+            },
+            &environment(),
+        )
         .unwrap();
     let error = service
         .initialize(InitializeParams {
@@ -162,10 +179,13 @@ fn switching_vaults_discards_root_scoped_state() {
     let mut service = WorkerService::new();
     initialize(&mut service, first.path());
     service
-        .overlay_upsert(obsidian_base_worker::protocol::OverlayUpsertParams {
-            path: "Draft.md".to_owned(),
-            contents: "# Unsaved draft\n".to_owned(),
-        })
+        .overlay_upsert(
+            obsidian_base_worker::protocol::OverlayUpsertParams {
+                path: "Draft.md".to_owned(),
+                contents: "# Unsaved draft\n".to_owned(),
+            },
+            &environment(),
+        )
         .unwrap();
     service.record_watcher_error("first vault error".to_owned());
 

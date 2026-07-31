@@ -6,10 +6,17 @@ use std::{
 };
 
 use obsidian_base_worker::{
-    WorkerService,
+    ExecutionEnvironment, WorkerService,
     protocol::{InitializeParams, LimitsPatch, QueryParams, QuerySource},
 };
 use tempfile::TempDir;
+
+fn environment() -> ExecutionEnvironment {
+    ExecutionEnvironment::new(
+        "2026-07-24T00:00:00Z".parse().unwrap(),
+        jiff::tz::TimeZone::UTC,
+    )
+}
 
 #[test]
 fn indexes_and_queries_five_thousand_files_within_thirty_seconds() {
@@ -36,15 +43,18 @@ fn indexes_and_queries_five_thousand_files_within_thirty_seconds() {
         })
         .unwrap();
     let result = service
-        .query(QueryParams {
-            source: QuerySource::Inline {
-                text: "views:\n  - type: table\n    name: Table\n    order: []\n".to_owned(),
-                source_id: None,
+        .query(
+            QueryParams {
+                source: QuerySource::Inline {
+                    text: "views:\n  - type: table\n    name: Table\n    order: []\n".to_owned(),
+                    source_id: None,
+                },
+                host_path: "Host.md".to_owned(),
+                view_name: Some("Table".to_owned()),
+                preview_rows: 1,
             },
-            host_path: "Host.md".to_owned(),
-            view_name: Some("Table".to_owned()),
-            preview_rows: 1,
-        })
+            &environment(),
+        )
         .unwrap();
     assert_eq!(result.matched_count, 5_001);
     assert_eq!(result.view_count, 5_001);

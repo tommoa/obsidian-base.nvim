@@ -9,6 +9,7 @@ use std::{
 use serde::Serialize;
 
 use crate::{
+    environment::ExecutionEnvironment,
     error::{Result, WorkerError},
     expression::{Expression, Literal, parse_expression, safe_key},
     index::{FileRecord, Index},
@@ -16,7 +17,7 @@ use crate::{
     protocol::{Column, QueryResult, View},
     value::{
         DataValue, EvalValue, format_utc_date, natural_cmp, parse_date, parse_duration,
-        sanitize_text,
+        round_number, sanitize_text,
     },
 };
 
@@ -73,6 +74,7 @@ pub fn execute(
     generation: u64,
     result_sequence: u64,
     result_id_allocated: &mut bool,
+    environment: &ExecutionEnvironment,
     input: QueryInput,
 ) -> Result<QueryOutput> {
     let base = crate::yaml::parse_mapping(&input.text, limits)?;
@@ -114,6 +116,7 @@ pub fn execute(
         index,
         limits,
         formulas: &formulas,
+        environment,
     };
     let mut matched = Vec::new();
     for record in index.records.values() {
@@ -516,6 +519,8 @@ struct Evaluator<'a> {
     limits: Limits,
     /// Compiled formulas referenced through the `formula` namespace.
     formulas: &'a BTreeMap<String, Expression>,
+    /// Wall-clock and local-time values captured for this query.
+    environment: &'a ExecutionEnvironment,
 }
 
 impl Evaluator<'_> {
@@ -676,7 +681,7 @@ impl Evaluator<'_> {
         if name == "value" {
             return context.value.clone().unwrap_or(EvalValue::Empty);
         }
-        if name == "date" {
+        if name == "date" || name == "today" {
             return EvalValue::Function(name.into());
         }
         self.current(context)
@@ -734,6 +739,10 @@ impl Evaluator<'_> {
             EvalValue::Duration(milliseconds) if property == "days" => {
                 Ok(EvalValue::Number(milliseconds / 86_400_000.0))
             }
+            EvalValue::Number(_) if property == "round" => Ok(EvalValue::Method {
+                target: Box::new(value),
+                property: property.into(),
+            }),
             EvalValue::Formula => self.formula(property, context, budget),
             _ if property == "isEmpty" => Ok(EvalValue::Method {
                 target: Box::new(value),
@@ -760,12 +769,26 @@ impl Evaluator<'_> {
                 let value = argument(args, 0);
                 return Ok(to_date(&value).map_or(EvalValue::Empty, EvalValue::Date));
             }
+            if name == "today" {
+                return Ok(EvalValue::Date(self.environment.today_milliseconds()));
+            }
         }
         let EvalValue::Method { target, property } = target else {
             return Ok(EvalValue::Empty);
         };
         match property.as_str() {
             "date" => Ok(*target),
+            "round" => {
+                let EvalValue::Number(value) = *target else {
+                    return Ok(EvalValue::Empty);
+                };
+                let digits = if args.is_empty() {
+                    0.0
+                } else {
+                    argument(args, 0).number()
+                };
+                Ok(EvalValue::Number(round_number(value, digits)))
+            }
             "isEmpty" => Ok(EvalValue::Bool(
                 matches!(*target, EvalValue::Empty | EvalValue::Null)
                     || matches!(&*target, EvalValue::String(value) if value.is_empty())
@@ -1059,7 +1082,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn call_arguments_follow_eager_and_callback_semantics() {
+    fn today_and_round_work_through_formula_dependencies() {
         let mut index = Index::empty(PathBuf::from("/vault"));
         index.records.insert(
             "Host.md".into(),
@@ -1080,43 +1103,87 @@ mod tests {
                 backlinks: Vec::new(),
             },
         );
-        let formulas = BTreeMap::from([
-            (
-                "cycle".into(),
-                parse_expression("formula.cycle", Limits::default()).unwrap(),
-            ),
-            (
-                "first_cycle".into(),
-                parse_expression("formula.first_cycle", Limits::default()).unwrap(),
-            ),
-            (
-                "second_cycle".into(),
-                parse_expression("formula.second_cycle", Limits::default()).unwrap(),
-            ),
-        ]);
+        let mut formulas = BTreeMap::new();
+        formulas.insert(
+            "time_alive".into(),
+            parse_expression("today() - file.ctime.date()", Limits::default()).unwrap(),
+        );
+        formulas.insert(
+            "days_alive".into(),
+            parse_expression("formula.time_alive.days.round()", Limits::default()).unwrap(),
+        );
+        formulas.insert(
+            "cycle".into(),
+            parse_expression("formula.cycle", Limits::default()).unwrap(),
+        );
+        formulas.insert(
+            "first_cycle".into(),
+            parse_expression("formula.first_cycle", Limits::default()).unwrap(),
+        );
+        formulas.insert(
+            "second_cycle".into(),
+            parse_expression("formula.second_cycle", Limits::default()).unwrap(),
+        );
+        let today = parse_date("2026-07-24").unwrap();
+        let environment = ExecutionEnvironment::new(
+            jiff::Timestamp::from_millisecond(today).unwrap(),
+            jiff::tz::TimeZone::UTC,
+        );
         let evaluator = Evaluator {
             index: &index,
             limits: Limits::default(),
             formulas: &formulas,
+            environment: &environment,
         };
-
         let mut context = EvalContext::new("Host.md", "Host.md");
         let mut budget = Budget::new(Limits::default());
-        let error = evaluator
+
+        let current = evaluator
             .evaluate(
-                &parse_expression("date(null, formula.cycle)", Limits::default()).unwrap(),
+                &parse_expression("today()", Limits::default()).unwrap(),
                 &mut context,
                 &mut budget,
             )
-            .unwrap_err();
-        assert_eq!(error.code, "formula_cycle");
+            .unwrap();
+        assert!(matches!(current, EvalValue::Date(value) if value == today));
+
+        let rounded = evaluator
+            .evaluate(
+                &parse_expression("(2.345).round(2)", Limits::default()).unwrap(),
+                &mut context,
+                &mut budget,
+            )
+            .unwrap();
+        assert!(matches!(rounded, EvalValue::Number(value) if value == 2.35));
+
+        let days_alive = evaluator
+            .evaluate(
+                &parse_expression("formula.days_alive", Limits::default()).unwrap(),
+                &mut context,
+                &mut budget,
+            )
+            .unwrap();
+        assert!(matches!(days_alive, EvalValue::Number(value) if value == 12.0));
+
+        for source in ["today(formula.cycle)", "(2.345).round(2, formula.cycle)"] {
+            let mut context = EvalContext::new("Host.md", "Host.md");
+            let mut budget = Budget::new(Limits::default());
+            let error = evaluator
+                .evaluate(
+                    &parse_expression(source, Limits::default()).unwrap(),
+                    &mut context,
+                    &mut budget,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "formula_cycle");
+        }
 
         let mut context = EvalContext::new("Host.md", "Host.md");
         let mut budget = Budget::new(Limits::default());
         let error = evaluator
             .evaluate(
                 &parse_expression(
-                    "date(null, formula.first_cycle, formula.second_cycle)",
+                    "today(formula.first_cycle, formula.second_cycle)",
                     Limits::default(),
                 )
                 .unwrap(),

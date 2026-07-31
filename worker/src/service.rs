@@ -3,10 +3,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
+    environment::ExecutionEnvironment,
     error::{Result, WorkerError},
     index::{Index, MetadataOverride, Overlay, metadata_overrides},
     limits::Limits,
@@ -86,21 +86,29 @@ impl WorkerService {
         Self { state: None }
     }
 
-    /// Dispatch a decoded command. Only this boundary can observe an uninitialized service.
-    /// Apply one typed request and return its typed success payload.
+    /// Dispatch a decoded command and return its typed success payload.
     ///
-    /// `Shutdown` returns its acknowledgement; the actor owns process termination.
-    pub fn handle(&mut self, request: crate::protocol::Request) -> Result<HandledRequest> {
+    /// This is the only dispatch boundary that can observe an uninitialized
+    /// service. Time-sensitive request variants share the supplied immutable
+    /// environment. `Shutdown` returns its acknowledgement; the actor owns
+    /// process termination.
+    pub fn handle(
+        &mut self,
+        request: crate::protocol::Request,
+        environment: &ExecutionEnvironment,
+    ) -> Result<HandledRequest> {
         let (success, index_change) = match request {
             crate::protocol::Request::Initialize(params) => {
                 (Success::Initialize(self.initialize(params)?), None)
             }
-            crate::protocol::Request::Query(params) => (Success::Query(self.query(params)?), None),
+            crate::protocol::Request::Query(params) => {
+                (Success::Query(self.query(params, environment)?), None)
+            }
             crate::protocol::Request::FetchRows(params) => {
                 (Success::FetchRows(self.fetch_rows(params)?), None)
             }
             crate::protocol::Request::OverlayUpsert(params) => {
-                let change = self.overlay_upsert(params)?;
+                let change = self.overlay_upsert(params, environment)?;
                 (
                     Success::OverlayUpsert(GenerationResult {
                         generation: change.generation,
@@ -177,7 +185,14 @@ impl WorkerService {
     }
 
     /// Evaluate a typed Base query against the initialized vault.
-    pub fn query(&mut self, params: QueryParams) -> Result<crate::protocol::QueryResult> {
+    ///
+    /// The explicit environment gives every row and formula in this query the
+    /// same instant and local calendar date.
+    pub fn query(
+        &mut self,
+        params: QueryParams,
+        environment: &ExecutionEnvironment,
+    ) -> Result<crate::protocol::QueryResult> {
         let state = self.initialized_mut()?;
         let host_path = relative_vault_path(&params.host_path)?;
         let (text, source_id) = match params.source {
@@ -199,6 +214,7 @@ impl WorkerService {
             state.generation,
             sequence,
             &mut result_id_allocated,
+            environment,
             QueryInput {
                 text,
                 source_id,
@@ -237,15 +253,24 @@ impl WorkerService {
     }
 
     /// Replace one unsaved buffer overlay and publish a new index generation.
-    pub fn overlay_upsert(&mut self, params: OverlayUpsertParams) -> Result<IndexChange> {
+    ///
+    /// A new overlay-only file receives the environment's captured instant as
+    /// its creation time. Replacing an existing overlay preserves its original
+    /// creation time.
+    pub fn overlay_upsert(
+        &mut self,
+        params: OverlayUpsertParams,
+        environment: &ExecutionEnvironment,
+    ) -> Result<IndexChange> {
         let path = relative_vault_path(&params.path)?;
         let generation = {
             let state = self.initialized_mut()?;
             state.limits.checked_text(&params.contents)?;
             let mut overlays = state.overlays.clone();
-            let created_at = overlays
-                .get(&path)
-                .map_or_else(now_milliseconds, |overlay| overlay.created_at);
+            let created_at = overlays.get(&path).map_or_else(
+                || environment.now_milliseconds(),
+                |overlay| overlay.created_at,
+            );
             overlays.insert(
                 path.clone(),
                 Overlay {
@@ -346,12 +371,5 @@ impl WorkerService {
         self.state
             .as_ref()
             .ok_or_else(|| WorkerError::new("not_initialized", "worker is not initialized"))
-    }
-}
-
-fn now_milliseconds() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(value) => i64::try_from(value.as_millis()).unwrap_or(i64::MAX),
-        Err(value) => -i64::try_from(value.duration().as_millis()).unwrap_or(i64::MAX),
     }
 }

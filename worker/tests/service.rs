@@ -6,12 +6,19 @@ use std::{
 };
 
 use obsidian_base_worker::{
-    WorkerService,
+    ExecutionEnvironment, WorkerService,
     protocol::{
         FetchRowsParams, InitializeParams, LimitsPatch, OverlayPathParams, OverlayUpsertParams,
         QueryParams, QuerySource,
     },
 };
+
+fn environment() -> ExecutionEnvironment {
+    ExecutionEnvironment::new(
+        "2026-07-24T00:00:00Z".parse().unwrap(),
+        jiff::tz::TimeZone::UTC,
+    )
+}
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures")
@@ -73,7 +80,7 @@ fn paths(result: &obsidian_base_worker::protocol::QueryResult) -> Vec<&str> {
 fn fixture_views_match_the_reference_results() {
     let mut service = initialized();
     let personal = service
-        .query(inline_query(&inline_base(2), "Personal"))
+        .query(inline_query(&inline_base(2), "Personal"), &environment())
         .unwrap();
     assert_eq!(
         paths(&personal),
@@ -88,7 +95,10 @@ fn fixture_views_match_the_reference_results() {
         ["Personal", "Work"]
     );
     let activity = service
-        .query(inline_query(&inline_base(1), "Activity tracker"))
+        .query(
+            inline_query(&inline_base(1), "Activity tracker"),
+            &environment(),
+        )
         .unwrap();
     assert_eq!(
         paths(&activity),
@@ -96,15 +106,18 @@ fn fixture_views_match_the_reference_results() {
     );
     assert_eq!(activity.preview_rows[0].cells[2].kind, "link");
     let file = service
-        .query(QueryParams {
-            source: QuerySource::File {
-                path: "Bases/Daily log tasks.base".to_owned(),
-                source_id: None,
+        .query(
+            QueryParams {
+                source: QuerySource::File {
+                    path: "Bases/Daily log tasks.base".to_owned(),
+                    source_id: None,
+                },
+                host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
+                view_name: Some("Work".to_owned()),
+                preview_rows: 20,
             },
-            host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
-            view_name: Some("Work".to_owned()),
-            preview_rows: 20,
-        })
+            &environment(),
+        )
         .unwrap();
     assert_eq!(
         paths(&file),
@@ -117,15 +130,18 @@ fn view_catalog_keeps_named_table_views_once_in_source_order() {
     let mut service = initialized();
     let source = "views:\n  - type: list\n    name: Unsupported\n  - type: table\n    name: Grouped\n    groupBy: property.group\n    order: []\n  - type: table\n    name: First\n    order: []\n  - type: table\n    name: First\n    order: []\n  - type: table\n    name: Second\n    order: []\n";
     let result = service
-        .query(QueryParams {
-            source: QuerySource::Inline {
-                text: source.to_owned(),
-                source_id: Some("fixture".to_owned()),
+        .query(
+            QueryParams {
+                source: QuerySource::Inline {
+                    text: source.to_owned(),
+                    source_id: Some("fixture".to_owned()),
+                },
+                host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
+                view_name: None,
+                preview_rows: 20,
             },
-            host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
-            view_name: None,
-            preview_rows: 20,
-        })
+            &environment(),
+        )
         .unwrap();
     assert_eq!(result.view.name, "First");
     assert_eq!(
@@ -144,15 +160,18 @@ fn unnamed_table_view_is_renderable_but_not_selectable() {
     let source =
         "views:\n  - type: table\n    order: []\n  - type: table\n    name: Named\n    order: []\n";
     let result = service
-        .query(QueryParams {
-            source: QuerySource::Inline {
-                text: source.to_owned(),
-                source_id: Some("fixture".to_owned()),
+        .query(
+            QueryParams {
+                source: QuerySource::Inline {
+                    text: source.to_owned(),
+                    source_id: Some("fixture".to_owned()),
+                },
+                host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
+                view_name: None,
+                preview_rows: 20,
             },
-            host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
-            view_name: None,
-            preview_rows: 20,
-        })
+            &environment(),
+        )
         .unwrap();
     assert_eq!(result.view.name, "table");
     assert_eq!(
@@ -170,15 +189,18 @@ fn empty_table_view_name_is_normalized_as_unnamed() {
     let mut service = initialized();
     let source = "views:\n  - type: table\n    name: \"\"\n    order: []\n  - type: table\n    name: Named\n    order: []\n";
     let result = service
-        .query(QueryParams {
-            source: QuerySource::Inline {
-                text: source.to_owned(),
-                source_id: Some("fixture".to_owned()),
+        .query(
+            QueryParams {
+                source: QuerySource::Inline {
+                    text: source.to_owned(),
+                    source_id: Some("fixture".to_owned()),
+                },
+                host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
+                view_name: None,
+                preview_rows: 20,
             },
-            host_path: "Calendar/Daily/2026-07-15.md".to_owned(),
-            view_name: None,
-            preview_rows: 20,
-        })
+            &environment(),
+        )
         .unwrap();
     assert_eq!(result.view.name, "table");
     assert_eq!(
@@ -190,7 +212,10 @@ fn empty_table_view_name_is_normalized_as_unnamed() {
         ["Named"]
     );
     assert_eq!(
-        service.query(inline_query(source, "")).unwrap_err().code,
+        service
+            .query(inline_query(source, ""), &environment())
+            .unwrap_err()
+            .code,
         "unknown_view"
     );
 }
@@ -199,7 +224,9 @@ fn empty_table_view_name_is_normalized_as_unnamed() {
 fn query_errors_preserve_the_current_view_catalog() {
     let mut service = initialized();
     let source = "views:\n  - type: table\n    name: Current\n    order: []\n  - type: table\n    name: Other\n    order: []\n";
-    let error = service.query(inline_query(source, "Removed")).unwrap_err();
+    let error = service
+        .query(inline_query(source, "Removed"), &environment())
+        .unwrap_err();
     assert_eq!(error.code, "unknown_view");
     assert_eq!(
         error
@@ -229,7 +256,10 @@ fn oversized_query_error_catalog_is_omitted() {
         .map(|index| format!("  - type: table\n    name: View {index}\n    order: []\n"))
         .collect::<String>();
     let error = service
-        .query(inline_query(&format!("views:\n{views}"), "Removed"))
+        .query(
+            inline_query(&format!("views:\n{views}"), "Removed"),
+            &environment(),
+        )
         .unwrap_err();
     assert_eq!(error.code, "unknown_view");
     assert!(error.available_views.is_none());
@@ -239,7 +269,7 @@ fn oversized_query_error_catalog_is_omitted() {
 fn overlays_emit_and_invalidate_cached_results() {
     let mut service = initialized();
     let before = service
-        .query(inline_query(&inline_base(2), "Work"))
+        .query(inline_query(&inline_base(2), "Work"), &environment())
         .unwrap();
     let result_id = before.result_id.clone();
     assert!(
@@ -250,11 +280,14 @@ fn overlays_emit_and_invalidate_cached_results() {
             .is_ok()
     );
     let change = service
-        .overlay_upsert(OverlayUpsertParams {
-            path: "Activities/Clean kitchen.md".to_owned(),
-            contents: fs::read_to_string(fixtures().join("overlays/Clean kitchen.work.md"))
-                .unwrap(),
-        })
+        .overlay_upsert(
+            OverlayUpsertParams {
+                path: "Activities/Clean kitchen.md".to_owned(),
+                contents: fs::read_to_string(fixtures().join("overlays/Clean kitchen.work.md"))
+                    .unwrap(),
+            },
+            &environment(),
+        )
         .unwrap();
     assert_eq!(change.generation, 2);
     assert_eq!(change.paths, ["Activities/Clean kitchen.md"]);
@@ -266,7 +299,7 @@ fn overlays_emit_and_invalidate_cached_results() {
         "unknown_result"
     );
     let work = service
-        .query(inline_query(&inline_base(2), "Work"))
+        .query(inline_query(&inline_base(2), "Work"), &environment())
         .unwrap();
     assert!(paths(&work).contains(&"Activities/Clean kitchen.md"));
 }
@@ -275,17 +308,21 @@ fn overlays_emit_and_invalidate_cached_results() {
 fn overlay_only_host_and_formula_cache_work() {
     let mut service = initialized();
     service
-        .overlay_upsert(OverlayUpsertParams {
-            path: "Draft.md".to_owned(),
-            contents: "---\nlabels: []\n---\n# Draft\n".to_owned(),
-        })
+        .overlay_upsert(
+            OverlayUpsertParams {
+                path: "Draft.md".to_owned(),
+                contents: "---\nlabels: []\n---\n# Draft\n".to_owned(),
+            },
+            &environment(),
+        )
         .unwrap();
-    let source = "filters:\n  - file.name == \"Draft\"\n  - property.labels.isEmpty()\nformulas:\n  self: file.asLink()\nviews:\n  - type: table\n    name: Table\n    order: [formula.self, formula.self]\n";
+    let source = "filters:\n  - file.name == \"Draft\"\n  - property.labels.isEmpty()\nformulas:\n  self: file.asLink()\nviews:\n  - type: table\n    name: Table\n    order: [formula.self, formula.self, file.ctime]\n";
     let result = service
-        .query(inline_query_at(source, "Table", "Draft.md"))
+        .query(inline_query_at(source, "Table", "Draft.md"), &environment())
         .unwrap();
     assert_eq!(paths(&result), ["Draft.md"]);
     assert_eq!(result.preview_rows[0].cells[0].text, "Draft");
+    assert_eq!(result.preview_rows[0].cells[2].text, "2026-07-24");
     service
         .overlay_remove(OverlayPathParams {
             path: "Draft.md".to_owned(),
@@ -293,7 +330,7 @@ fn overlay_only_host_and_formula_cache_work() {
         .unwrap();
     assert_eq!(
         service
-            .query(inline_query_at(source, "Table", "Draft.md"))
+            .query(inline_query_at(source, "Table", "Draft.md"), &environment(),)
             .unwrap_err()
             .code,
         "missing_host"
@@ -317,7 +354,7 @@ fn query_wide_limits_and_result_bytes_are_enforced() {
     let source = "filters: file.name == \"never\"\nviews:\n  - type: table\n    name: Table\n    order: []\n";
     assert_eq!(
         service
-            .query(inline_query(source, "Table"))
+            .query(inline_query(source, "Table"), &environment())
             .unwrap_err()
             .code,
         "evaluation_limit"
@@ -327,7 +364,7 @@ fn query_wide_limits_and_result_bytes_are_enforced() {
     let invalid = "views:\n  - type: table\n    name: Table\n    limit: -1\n    order: []\n";
     assert_eq!(
         service
-            .query(inline_query(invalid, "Table"))
+            .query(inline_query(invalid, "Table"), &environment())
             .unwrap_err()
             .code,
         "invalid_view"
@@ -343,10 +380,13 @@ fn result_ids_follow_the_query_allocation_boundary() {
         text: source,
         source_id: Some("invalid".to_owned()),
     };
-    assert_eq!(service.query(invalid).unwrap_err().code, "unknown_view");
+    assert_eq!(
+        service.query(invalid, &environment()).unwrap_err().code,
+        "unknown_view"
+    );
     assert_eq!(
         service
-            .query(inline_query(&inline_base(2), "Personal"))
+            .query(inline_query(&inline_base(2), "Personal"), &environment(),)
             .unwrap()
             .result_id,
         "r1-1"
@@ -359,10 +399,13 @@ fn result_ids_follow_the_query_allocation_boundary() {
         text: cycle.to_owned(),
         source_id: Some("cycle".to_owned()),
     };
-    assert_eq!(service.query(cyclic).unwrap_err().code, "formula_cycle");
+    assert_eq!(
+        service.query(cyclic, &environment()).unwrap_err().code,
+        "formula_cycle"
+    );
     assert_eq!(
         service
-            .query(inline_query(&inline_base(2), "Personal"))
+            .query(inline_query(&inline_base(2), "Personal"), &environment(),)
             .unwrap()
             .result_id,
         "r1-2"

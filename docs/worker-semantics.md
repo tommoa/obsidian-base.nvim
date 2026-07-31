@@ -22,7 +22,7 @@ YAML must contain one top-level mapping. Aliases, anchors, explicit tags, merge 
 
 Expressions support strings, decimal numbers, booleans, null, identifiers, member/index access, calls, unary `!`, `not`, and `-`, and binary `* / + - > >= < <= == != && and || or`. Binary operators are left associative with conventional precedence. There is no JavaScript fallback or dynamic evaluation. Source bytes, AST nodes, and AST depth are bounded.
 
-Visible roots are `file`/`note`, `this`, `property`, `formula`, `value`, and `date`. Supported file members are `file`, `name`, `path`, `backlinks`, `ctime`, `mtime`, `hasTag`, `inFolder`, and `asLink`. Links support `asFile`; dates support `date`; values support `isEmpty`; lists support `filter`, `map`, `sort`, and `slice`.
+Visible roots are `file`/`note`, `this`, `property`, `formula`, `value`, `date`, and `today`. Supported file members are `file`, `name`, `path`, `backlinks`, `ctime`, `mtime`, `hasTag`, `inFolder`, and `asLink`. Links support `asFile`; dates support `date`; numbers support `round` with an optional decimal precision; values support `isEmpty`; lists support `filter`, `map`, `sort`, and `slice`.
 
 Binary logical operands and ordinary call arguments are evaluated eagerly from left to right. YAML filter groups short-circuit. The single expression passed to `filter` or `map` is evaluated once per list item; other callback arities are errors. Formula values are cached per record, dependencies are lazy, and cycles/depth overflow are errors. One step and monotonic wall-clock budget covers all records, filters, formulas, sort keys, list callbacks, and rendered columns in a query.
 
@@ -31,6 +31,8 @@ Binary logical operands and ordinary call arguments are evaluated eagerly from l
 Empty values, null, empty strings, and empty lists are empty for `isEmpty`. Hierarchical tags imply their parents. Date subtraction yields a duration; duration strings accept day, week, month, and year units with the fixed millisecond scales.
 
 Dates accept exactly `YYYY-MM-DD` or RFC 3339 timestamps with explicit `Z` or numeric offset. Date-only values mean midnight UTC. Rendered date cells use the UTC calendar date. An invalid typed date property remains its original scalar; `date(invalid)` returns the empty evaluator value.
+
+`today()` uses the local calendar date from the query's immutable execution environment and encodes it as a date-only value. The worker actor captures the system time and time zone once per request; tests may supply them explicitly. Existing refresh and re-query paths update the environment, but open previews are not scheduled to refresh automatically at midnight.
 
 Natural ordering is locale-independent. ASCII digit runs compare by magnitude without integer conversion, then leading-zero count and bytes. Non-digit text compares case-sensitively by Unicode scalar value. Normalized path bytes provide the final path order. This comparator is used for view sort values, path ties, list sorting, and link fallback selection.
 

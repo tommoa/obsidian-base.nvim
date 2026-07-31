@@ -6,7 +6,12 @@ rust-version = "1.85"
 license = "Apache-2.0"
 
 [dependencies]
-jiff = { version = "0.2.15", default-features = false, features = ["std"] }
+jiff = { version = "0.2.15", default-features = false, features = [
+  "std",
+  "tz-system",
+  "tzdb-bundle-platform",
+  "tzdb-zoneinfo",
+] }
 notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 pulldown-cmark = { version = "0.13.0", default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
