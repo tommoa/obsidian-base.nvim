@@ -10,8 +10,8 @@ use tokio::{
 use crate::{
     environment::ExecutionEnvironment,
     protocol::{
-        ErrorPayload, Event, EventEnvelope, IndexChangeOrigin, Request, RequestId,
-        ResponseEnvelope, WorkerEnvelope, decode,
+        self, ErrorPayload, Event, EventEnvelope, IndexChangeOrigin, Request, RequestId,
+        ResponseEnvelope, WorkerEnvelope,
     },
     service::{IndexChange, WorkerService},
     watch::{VaultWatcher, WatchMessage},
@@ -101,7 +101,7 @@ impl WorkerActor {
     }
 
     async fn handle_line(&mut self, line: &str) -> bool {
-        let envelope = match decode(line) {
+        let envelope = match protocol::decode(line) {
             Ok(envelope) => envelope,
             Err(message) => {
                 self.send_error(RequestId::INVALID, "invalid_request", message);

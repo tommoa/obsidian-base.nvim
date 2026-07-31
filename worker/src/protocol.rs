@@ -32,7 +32,7 @@ pub struct RequestEnvelope {
 )]
 pub enum Request {
     /// Create or replace the active vault snapshot.
-    Initialize(InitializeParams),
+    Initialize(InitialiseParams),
     /// Evaluate a Base source against the active vault.
     Query(QueryParams),
     /// Retrieve all rows retained for a prior query.
@@ -68,7 +68,7 @@ impl TryFrom<u64> for RequestId {
     type Error = &'static str;
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
-        if value <= 9_007_199_254_740_991 {
+        if value <= 0x1FFFFFFFFFFFFF {
             Ok(Self(value))
         } else {
             Err("request id exceeds Lua integer precision")
@@ -82,9 +82,10 @@ impl From<RequestId> for u64 {
     }
 }
 
+/// The parameters required to initialise a vault.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct InitializeParams {
+pub struct InitialiseParams {
     /// Filesystem path of the vault to scan.
     pub vault_root: String,
     /// Optional filesystem-time overrides keyed by vault-relative path.
@@ -95,7 +96,7 @@ pub struct InitializeParams {
     pub limits: LimitsPatch,
 }
 
-/// Typed timestamp override supplied during initialization.
+/// Typed timestamp override supplied during initialisation.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetadataOverrideParams {
@@ -217,12 +218,27 @@ impl ResponseEnvelope {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    from = "Result<Success, ErrorPayload>"
+)]
+/// Success-or-error response body serialized with a stable `type` discriminator.
 pub enum Response {
     /// Operation completed with typed result data.
     Success { result: Success },
     /// Operation failed with a stable code and diagnostic message.
     Error { error: ErrorPayload },
+}
+
+/// Convert the dispatch layer's conventional result into its protocol representation.
+impl From<Result<Success, ErrorPayload>> for Response {
+    fn from(value: Result<Success, ErrorPayload>) -> Self {
+        match value {
+            Ok(value) => Response::Success { result: value },
+            Err(value) => Response::Error { error: value },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

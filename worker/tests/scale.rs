@@ -7,7 +7,7 @@ use std::{
 
 use obsidian_base_worker::{
     ExecutionEnvironment, WorkerService,
-    protocol::{InitializeParams, LimitsPatch, QueryParams, QuerySource},
+    protocol::{InitialiseParams, LimitsPatch, QueryParams, QuerySource},
 };
 use tempfile::TempDir;
 
@@ -32,7 +32,7 @@ fn indexes_and_queries_five_thousand_files_within_thirty_seconds() {
     }
     let mut service = WorkerService::new();
     service
-        .initialize(InitializeParams {
+        .initialize(InitialiseParams {
             vault_root: root.path().to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {

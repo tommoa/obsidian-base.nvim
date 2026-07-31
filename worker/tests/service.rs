@@ -8,7 +8,7 @@ use std::{
 use obsidian_base_worker::{
     ExecutionEnvironment, WorkerService,
     protocol::{
-        FetchRowsParams, InitializeParams, LimitsPatch, OverlayPathParams, OverlayUpsertParams,
+        FetchRowsParams, InitialiseParams, LimitsPatch, OverlayPathParams, OverlayUpsertParams,
         QueryParams, QuerySource,
     },
 };
@@ -31,7 +31,7 @@ fn initialized() -> WorkerService {
             .unwrap();
     let metadata_overrides = serde_json::from_value(manifest["metadata"].clone()).unwrap();
     service
-        .initialize(InitializeParams {
+        .initialize(InitialiseParams {
             vault_root: fixtures().join("vault").to_string_lossy().into_owned(),
             metadata_overrides,
             limits: LimitsPatch::default(),
@@ -243,7 +243,7 @@ fn query_errors_preserve_the_current_view_catalog() {
 fn oversized_query_error_catalog_is_omitted() {
     let mut service = WorkerService::new();
     service
-        .initialize(InitializeParams {
+        .initialize(InitialiseParams {
             vault_root: fixtures().join("vault").to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {
@@ -341,7 +341,7 @@ fn overlay_only_host_and_formula_cache_work() {
 fn query_wide_limits_and_result_bytes_are_enforced() {
     let mut service = WorkerService::new();
     service
-        .initialize(InitializeParams {
+        .initialize(InitialiseParams {
             vault_root: fixtures().join("vault").to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {

@@ -12,7 +12,7 @@ use crate::{
     limits::Limits,
     path::{canonical_contained, relative_vault_path},
     protocol::{
-        FetchRowsParams, FetchRowsResult, GenerationResult, InitializeParams, InitializeResult,
+        FetchRowsParams, FetchRowsResult, GenerationResult, InitialiseParams, InitializeResult,
         InspectResult, OverlayPathParams, OverlayUpsertParams, QueryParams, QuerySource, Success,
     },
     query::{QueryInput, ResultRow, execute},
@@ -144,7 +144,7 @@ impl WorkerService {
     }
 
     /// Build and publish a new vault snapshot from typed initialization inputs.
-    pub fn initialize(&mut self, params: InitializeParams) -> Result<InitializeResult> {
+    pub fn initialize(&mut self, params: InitialiseParams) -> Result<InitializeResult> {
         let root = Path::new(&params.vault_root)
             .canonicalize()
             .map_err(WorkerError::io)?;

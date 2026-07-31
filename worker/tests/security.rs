@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fs, num::NonZeroUsize, path::Path};
 
 use obsidian_base_worker::{
     ExecutionEnvironment, WorkerService,
-    protocol::{FetchRowsParams, InitializeParams, LimitsPatch, QueryParams, QuerySource},
+    protocol::{FetchRowsParams, InitialiseParams, LimitsPatch, QueryParams, QuerySource},
 };
 use tempfile::TempDir;
 
@@ -20,7 +20,7 @@ fn host(root: &Path) {
 
 fn initialize(service: &mut WorkerService, root: &Path) {
     service
-        .initialize(InitializeParams {
+        .initialize(InitialiseParams {
             vault_root: root.to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch::default(),
@@ -121,7 +121,7 @@ fn rejects_vault_text_larger_than_the_configured_limit() {
     fs::write(root.path().join("Large.md"), "x".repeat(65)).unwrap();
     let mut service = WorkerService::new();
     let error = service
-        .initialize(InitializeParams {
+        .initialize(InitialiseParams {
             vault_root: root.path().to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {
@@ -139,7 +139,7 @@ fn rejects_existing_overlays_when_the_limit_is_lowered() {
     fs::write(root.path().join("Host.md"), "# Host\n").unwrap();
     let mut service = WorkerService::new();
     service
-        .initialize(InitializeParams {
+        .initialize(InitialiseParams {
             vault_root: root.path().to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {
@@ -158,7 +158,7 @@ fn rejects_existing_overlays_when_the_limit_is_lowered() {
         )
         .unwrap();
     let error = service
-        .initialize(InitializeParams {
+        .initialize(InitialiseParams {
             vault_root: root.path().to_string_lossy().into_owned(),
             metadata_overrides: BTreeMap::new(),
             limits: LimitsPatch {
