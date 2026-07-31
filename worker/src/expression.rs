@@ -1,4 +1,11 @@
-//! Lexer and bounded recursive-descent parser for the supported Bases expression subset.
+//! Lexer and recursive-descent parser for the supported Bases expression subset.
+//!
+//! Bases expressions broadly [follow JavaScript behaviour], but this module
+//! deliberately recognizes only the operators, literals, member access, and
+//! calls implemented by the worker. It builds a bounded AST and never invokes
+//! a JavaScript runtime.
+//!
+//! [follow JavaScript behaviour]: https://obsidian.md/help/bases/functions
 
 use crate::{
     error::{Result, WorkerError},
@@ -29,7 +36,10 @@ pub enum Expression {
     Member(Box<Expression>, String),
     /// Numeric list indexing on an evaluated receiver.
     Index(Box<Expression>, Box<Expression>),
-    /// Function or method invocation with expression arguments.
+    /// Function or method invocation.
+    ///
+    /// Arguments remain unevaluated AST nodes because list callbacks such as
+    /// `filter` and `map` bind `value` separately for every item.
     Call(Box<Expression>, Vec<Expression>),
     /// Prefix logical-not or numeric-negation operation.
     Unary(String, Box<Expression>),
@@ -62,6 +72,11 @@ impl Token {
     }
 }
 
+/// Parse a source string into an expression.
+///
+/// [`Limits`] bounds source bytes, AST nodes, and parser nesting. The parser
+/// also requires the complete source to be consumed, so valid prefixes cannot
+/// hide unsupported trailing syntax.
 pub fn parse_expression(source: &str, limits: Limits) -> Result<Expression> {
     if source.len() > limits.expression_bytes {
         return Err(WorkerError::new(
@@ -87,6 +102,10 @@ pub fn parse_expression(source: &str, limits: Limits) -> Result<Expression> {
     Ok(expression)
 }
 
+/// Tokenize the supported expression grammar into literals, identifiers, and operators.
+///
+/// Delimiters are represented as operator tokens; a synthetic [`Token::Eof`]
+/// lets the parser distinguish a complete expression from truncated input.
 fn lex(source: &str) -> Result<Vec<Token>> {
     let bytes = source.as_bytes();
     let mut tokens = Vec::new();

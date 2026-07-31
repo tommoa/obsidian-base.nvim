@@ -24,7 +24,7 @@ Expressions support strings, decimal numbers, booleans, null, identifiers, membe
 
 Visible roots are `file`/`note`, `this`, `property`, `formula`, `value`, and `date`. Supported file members are `file`, `name`, `path`, `backlinks`, `ctime`, `mtime`, `hasTag`, `inFolder`, and `asLink`. Links support `asFile`; dates support `date`; values support `isEmpty`; lists support `filter`, `map`, `sort`, and `slice`.
 
-Binary logical operands are evaluated eagerly. YAML filter groups short-circuit. Formula values are cached per record, dependencies are lazy, and cycles/depth overflow are errors. One step and monotonic wall-clock budget covers all records, filters, formulas, sort keys, list callbacks, and rendered columns in a query.
+Binary logical operands and ordinary call arguments are evaluated eagerly from left to right. YAML filter groups short-circuit. The single expression passed to `filter` or `map` is evaluated once per list item; other callback arities are errors. Formula values are cached per record, dependencies are lazy, and cycles/depth overflow are errors. One step and monotonic wall-clock budget covers all records, filters, formulas, sort keys, list callbacks, and rendered columns in a query.
 
 ## Values, Dates, And Sorting
 

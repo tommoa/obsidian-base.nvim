@@ -643,7 +643,19 @@ impl Evaluator<'_> {
             }
             Expression::Call(callee, args) => {
                 let target = self.evaluate(callee, context, budget)?;
-                self.call(target, args, context, budget)
+                // Ordinary Bases calls follow JavaScript's eager, left-to-right argument
+                // evaluation. `filter` and `map` are expression-language special forms:
+                // their argument must remain an AST so it can be re-evaluated with a new
+                // dynamic `value` for each list item.
+                if callback_call(&target) {
+                    self.call_callback(target, args, context, budget)
+                } else {
+                    let args = args
+                        .iter()
+                        .map(|argument| self.evaluate(argument, context, budget))
+                        .collect::<Result<Vec<_>>>()?;
+                    self.call_eager(target, &args)
+                }
             }
         }
     }
@@ -741,20 +753,11 @@ impl Evaluator<'_> {
         }
     }
 
-    fn call(
-        &self,
-        target: EvalValue,
-        args: &[Expression],
-        context: &mut EvalContext,
-        budget: &mut Budget,
-    ) -> Result<EvalValue> {
+    /// Dispatch an ordinary builtin after all of its arguments have been evaluated.
+    fn call_eager(&self, target: EvalValue, args: &[EvalValue]) -> Result<EvalValue> {
         if let EvalValue::Function(name) = &target {
             if name == "date" {
-                let value = args
-                    .first()
-                    .map(|arg| self.evaluate(arg, context, budget))
-                    .transpose()?
-                    .unwrap_or(EvalValue::Empty);
+                let value = argument(args, 0);
                 return Ok(to_date(&value).map_or(EvalValue::Empty, EvalValue::Date));
             }
         }
@@ -769,7 +772,7 @@ impl Evaluator<'_> {
                     || matches!(&*target, EvalValue::List(value) if value.is_empty()),
             )),
             "hasTag" => {
-                let wanted = self.argument(args, 0, context, budget)?.string();
+                let wanted = argument(args, 0).string();
                 let EvalValue::File(path) = *target else {
                     return Ok(EvalValue::Empty);
                 };
@@ -783,7 +786,7 @@ impl Evaluator<'_> {
                 )))
             }
             "inFolder" => {
-                let wanted = self.argument(args, 0, context, budget)?.string();
+                let wanted = argument(args, 0).string();
                 let EvalValue::File(path) = *target else {
                     return Ok(EvalValue::Empty);
                 };
@@ -799,7 +802,7 @@ impl Evaluator<'_> {
                 let display = if args.is_empty() {
                     self.index.records[&path].name.clone()
                 } else {
-                    self.argument(args, 0, context, budget)?.string()
+                    argument(args, 0).string()
                 };
                 Ok(EvalValue::Link {
                     path,
@@ -827,21 +830,8 @@ impl Evaluator<'_> {
                 let EvalValue::List(values) = *target else {
                     return Ok(EvalValue::Empty);
                 };
-                let start = args
-                    .first()
-                    .map(|arg| {
-                        self.evaluate(arg, context, budget)
-                            .map(|value| value.number())
-                    })
-                    .transpose()?
-                    .unwrap_or(0.0);
-                let end = args
-                    .get(1)
-                    .map(|arg| {
-                        self.evaluate(arg, context, budget)
-                            .map(|value| value.number())
-                    })
-                    .transpose()?;
+                let start = args.first().map(EvalValue::number).unwrap_or(0.0);
+                let end = args.get(1).map(EvalValue::number);
                 let start = slice_index(start, values.len());
                 let end = end.map_or(values.len(), |end| slice_index(end, values.len()));
                 Ok(EvalValue::List(if start <= end {
@@ -850,43 +840,49 @@ impl Evaluator<'_> {
                     Vec::new()
                 }))
             }
-            "filter" | "map" => {
-                let EvalValue::List(values) = *target else {
-                    return Ok(EvalValue::Empty);
-                };
-                let Some(expression) = args.first() else {
-                    return Ok(EvalValue::List(Vec::new()));
-                };
-                // `value` is dynamically scoped within a list callback and must be restored for
-                // the surrounding expression.
-                let previous = context.value.clone();
-                let mut result = Vec::new();
-                for item in values {
-                    context.value = Some(item.clone());
-                    let mapped = self.evaluate(expression, context, budget)?;
-                    if property == "map" {
-                        result.push(mapped);
-                    } else if mapped.truthy() {
-                        result.push(item);
-                    }
-                }
-                context.value = previous;
-                Ok(EvalValue::List(result))
-            }
             _ => Ok(EvalValue::Empty),
         }
     }
 
-    fn argument(
+    /// Evaluate the one expression accepted by a list callback for every list item.
+    fn call_callback(
         &self,
+        target: EvalValue,
         args: &[Expression],
-        index: usize,
         context: &mut EvalContext,
         budget: &mut Budget,
     ) -> Result<EvalValue> {
-        args.get(index)
-            .map(|arg| self.evaluate(arg, context, budget))
-            .unwrap_or(Ok(EvalValue::Empty))
+        let EvalValue::Method { target, property } = target else {
+            return Ok(EvalValue::Empty);
+        };
+        let EvalValue::List(values) = *target else {
+            return Ok(EvalValue::Empty);
+        };
+        if args.len() != 1 {
+            return Err(WorkerError::new(
+                "invalid_arguments",
+                format!("{property} expects exactly one expression"),
+            ));
+        }
+        let expression = &args[0];
+        // `value` is dynamically scoped within a list callback and must be restored for
+        // the surrounding expression, including when callback evaluation fails.
+        let previous = context.value.clone();
+        let result = (|| {
+            let mut result = Vec::new();
+            for item in values {
+                context.value = Some(item.clone());
+                let mapped = self.evaluate(expression, context, budget)?;
+                if property == "map" {
+                    result.push(mapped);
+                } else if mapped.truthy() {
+                    result.push(item);
+                }
+            }
+            Ok(EvalValue::List(result))
+        })();
+        context.value = previous;
+        result
     }
 
     fn formula(
@@ -923,6 +919,18 @@ impl Evaluator<'_> {
     fn current<'a>(&'a self, context: &EvalContext) -> &'a FileRecord {
         &self.index.records[&context.current]
     }
+}
+
+/// Return whether a resolved method uses callback-expression evaluation.
+fn callback_call(target: &EvalValue) -> bool {
+    matches!(
+        target,
+        EvalValue::Method { property, .. } if property == "filter" || property == "map"
+    )
+}
+
+fn argument(args: &[EvalValue], index: usize) -> EvalValue {
+    args.get(index).cloned().unwrap_or(EvalValue::Empty)
 }
 
 fn binary(operator: &str, left: EvalValue, right: EvalValue) -> EvalValue {
@@ -1042,5 +1050,110 @@ fn cell(value: EvalValue) -> Cell {
             text: sanitize_text(&value.string()),
             target: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn call_arguments_follow_eager_and_callback_semantics() {
+        let mut index = Index::empty(PathBuf::from("/vault"));
+        index.records.insert(
+            "Host.md".into(),
+            FileRecord {
+                path: "Host.md".into(),
+                name: "Host".into(),
+                basename: "Host.md".into(),
+                folder: String::new(),
+                extension: "md".into(),
+                ctime: parse_date("2026-07-12").unwrap(),
+                mtime: parse_date("2026-07-12").unwrap(),
+                properties: BTreeMap::from([(
+                    "numbers".into(),
+                    DataValue::List(vec![DataValue::Number(1.0), DataValue::Number(2.0)]),
+                )]),
+                tags: Vec::new(),
+                links: Vec::new(),
+                backlinks: Vec::new(),
+            },
+        );
+        let formulas = BTreeMap::from([
+            (
+                "cycle".into(),
+                parse_expression("formula.cycle", Limits::default()).unwrap(),
+            ),
+            (
+                "first_cycle".into(),
+                parse_expression("formula.first_cycle", Limits::default()).unwrap(),
+            ),
+            (
+                "second_cycle".into(),
+                parse_expression("formula.second_cycle", Limits::default()).unwrap(),
+            ),
+        ]);
+        let evaluator = Evaluator {
+            index: &index,
+            limits: Limits::default(),
+            formulas: &formulas,
+        };
+
+        let mut context = EvalContext::new("Host.md", "Host.md");
+        let mut budget = Budget::new(Limits::default());
+        let error = evaluator
+            .evaluate(
+                &parse_expression("date(null, formula.cycle)", Limits::default()).unwrap(),
+                &mut context,
+                &mut budget,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "formula_cycle");
+
+        let mut context = EvalContext::new("Host.md", "Host.md");
+        let mut budget = Budget::new(Limits::default());
+        let error = evaluator
+            .evaluate(
+                &parse_expression(
+                    "date(null, formula.first_cycle, formula.second_cycle)",
+                    Limits::default(),
+                )
+                .unwrap(),
+                &mut context,
+                &mut budget,
+            )
+            .unwrap_err();
+        assert_eq!(error.message, "formula cycle at first_cycle");
+
+        let mut context = EvalContext::new("Host.md", "Host.md");
+        let mut budget = Budget::new(Limits::default());
+        let mapped = evaluator
+            .evaluate(
+                &parse_expression("numbers.map(value + 1)", Limits::default()).unwrap(),
+                &mut context,
+                &mut budget,
+            )
+            .unwrap();
+        assert!(matches!(
+            mapped,
+            EvalValue::List(values)
+                if matches!(values.as_slice(),
+                    [EvalValue::Number(first), EvalValue::Number(second)]
+                        if *first == 2.0 && *second == 3.0)
+        ));
+
+        for source in ["numbers.map()", "numbers.filter(value, value)"] {
+            let mut context = EvalContext::new("Host.md", "Host.md");
+            let mut budget = Budget::new(Limits::default());
+            let error = evaluator
+                .evaluate(
+                    &parse_expression(source, Limits::default()).unwrap(),
+                    &mut context,
+                    &mut budget,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_arguments");
+        }
     }
 }
