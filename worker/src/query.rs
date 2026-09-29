@@ -154,11 +154,24 @@ pub fn execute(
                 .map_err(recover)?;
             sort_keys.insert(path.clone(), keys);
         }
+        let numeric_sort = sort_rules
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                sort_keys
+                    .values()
+                    .all(|keys| matches!(keys[index], EvalValue::Number(_)))
+            })
+            .collect::<Vec<_>>();
         matched.sort_by(|left, right| {
             let left_keys = &sort_keys[left];
             let right_keys = &sort_keys[right];
             for (index, rule) in sort_rules.iter().enumerate() {
-                let order = compare(&left_keys[index], &right_keys[index]);
+                let order = compare_with_numeric_order(
+                    &left_keys[index],
+                    &right_keys[index],
+                    numeric_sort[index],
+                );
                 let order = if rule.descending {
                     order.reverse()
                 } else {
@@ -846,7 +859,10 @@ impl Evaluator<'_> {
                 let EvalValue::List(mut values) = *target else {
                     return Ok(EvalValue::Empty);
                 };
-                values.sort_by(compare);
+                let numeric_sort = values
+                    .iter()
+                    .all(|value| matches!(value, EvalValue::Number(_)));
+                values.sort_by(|left, right| compare_with_numeric_order(left, right, numeric_sort));
                 Ok(EvalValue::List(values))
             }
             "slice" => {
@@ -982,6 +998,15 @@ fn binary(operator: &str, left: EvalValue, right: EvalValue) -> EvalValue {
 }
 
 fn compare(left: &EvalValue, right: &EvalValue) -> Ordering {
+    compare_with_numeric_order(left, right, true)
+}
+
+/// Mixed sort keys keep natural order so the numeric rule cannot form a comparison cycle.
+fn compare_with_numeric_order(
+    left: &EvalValue,
+    right: &EvalValue,
+    numeric_order: bool,
+) -> Ordering {
     if let (Some(left), Some(right)) = (left.path(), right.path()) {
         return natural_cmp(left, right);
     }
@@ -990,6 +1015,13 @@ fn compare(left: &EvalValue, right: &EvalValue) -> Ordering {
     }
     if let (Some(left), Some(right)) = (to_date(left), to_date(right)) {
         return left.cmp(&right);
+    }
+    if let (true, EvalValue::Number(left), EvalValue::Number(right)) = (numeric_order, left, right)
+    {
+        // Keep the existing string ordering for NaN, which has no numeric order.
+        return left
+            .partial_cmp(right)
+            .unwrap_or_else(|| natural_cmp(&left.to_string(), &right.to_string()));
     }
     natural_cmp(&left.string(), &right.string())
 }
@@ -1080,6 +1112,79 @@ fn cell(value: EvalValue) -> Cell {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn numeric_comparisons_and_sort_use_numeric_order() {
+        let number = EvalValue::Number;
+        for (operator, left, right, expected) in [
+            ("<", -10.0, -2.0, true),
+            (">", -2.0, -10.0, true),
+            ("<", 2.0, 10.0, true),
+            (">", 1.2, 1.10, true),
+            ("==", 1.2, 1.20, true),
+            ("<=", -2.5, -2.5, true),
+            ("<", -2.0, -10.0, false),
+            ("==", 1.2, 1.10, false),
+        ] {
+            assert!(matches!(
+                binary(operator, number(left), number(right)),
+                EvalValue::Bool(value) if value == expected
+            ));
+        }
+
+        let mut values = [-2.0, 1.2, -10.0, 10.0, 1.10, 2.0].map(number).to_vec();
+        values.sort_by(compare);
+        assert_eq!(
+            values.iter().map(EvalValue::number).collect::<Vec<_>>(),
+            [-10.0, -2.0, 1.10, 1.2, 2.0, 10.0]
+        );
+    }
+
+    #[test]
+    fn non_numeric_comparisons_keep_their_order() {
+        let earlier = parse_date("2026-07-01").unwrap();
+        assert_eq!(
+            compare(
+                &EvalValue::Date(earlier),
+                &EvalValue::String("2026-07-02".into())
+            ),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare(
+                &EvalValue::Duration(86_400_000.0),
+                &EvalValue::String("2 days".into())
+            ),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare(
+                &EvalValue::String("item2".into()),
+                &EvalValue::String("item10".into())
+            ),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare(&EvalValue::Number(1.2), &EvalValue::String("1.10".into())),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn mixed_sort_values_keep_natural_order() {
+        let mut values = [
+            EvalValue::Number(-10.0),
+            EvalValue::Number(-2.0),
+            EvalValue::String("-10".into()),
+        ];
+        let numeric_sort = values
+            .iter()
+            .all(|value| matches!(value, EvalValue::Number(_)));
+        values.sort_by(|left, right| compare_with_numeric_order(left, right, numeric_sort));
+        assert!(matches!(values[0], EvalValue::Number(-2.0)));
+        assert!(matches!(values[1], EvalValue::Number(-10.0)));
+        assert!(matches!(&values[2], EvalValue::String(value) if value == "-10"));
+    }
 
     #[test]
     fn today_and_round_work_through_formula_dependencies() {

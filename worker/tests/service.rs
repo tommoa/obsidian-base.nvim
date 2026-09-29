@@ -126,6 +126,54 @@ fn fixture_views_match_the_reference_results() {
 }
 
 #[test]
+fn view_sort_orders_negative_and_decimal_numbers() {
+    let vault = tempfile::tempdir().unwrap();
+    for (name, score) in [
+        ("a", -2.0),
+        ("b", -10.0),
+        ("c", 1.2),
+        ("d", 1.10),
+        ("e", 10.0),
+    ] {
+        fs::write(
+            vault.path().join(format!("{name}.md")),
+            format!("---\nscore: {score}\n---\n"),
+        )
+        .unwrap();
+    }
+    let mut service = WorkerService::new();
+    service
+        .initialize(InitialiseParams {
+            vault_root: vault.path().to_string_lossy().into_owned(),
+            metadata_overrides: BTreeMap::new(),
+            limits: LimitsPatch::default(),
+        })
+        .unwrap();
+    let source = "views:\n  - type: table\n    name: Numeric\n    sort:\n      - property: property.score\n    order: [file.name]\n";
+    let result = service
+        .query(inline_query_at(source, "Numeric", "a.md"), &environment())
+        .unwrap();
+    assert_eq!(paths(&result), ["b.md", "a.md", "d.md", "c.md", "e.md"]);
+
+    service
+        .overlay_upsert(
+            OverlayUpsertParams {
+                path: "f.md".to_owned(),
+                contents: "---\nscore: \"-10\"\n---\n".to_owned(),
+            },
+            &environment(),
+        )
+        .unwrap();
+    let mixed = service
+        .query(inline_query_at(source, "Numeric", "a.md"), &environment())
+        .unwrap();
+    assert_eq!(
+        paths(&mixed),
+        ["a.md", "b.md", "f.md", "d.md", "c.md", "e.md"]
+    );
+}
+
+#[test]
 fn view_catalog_keeps_named_table_views_once_in_source_order() {
     let mut service = initialized();
     let source = "views:\n  - type: list\n    name: Unsupported\n  - type: table\n    name: Grouped\n    groupBy: property.group\n    order: []\n  - type: table\n    name: First\n    order: []\n  - type: table\n    name: First\n    order: []\n  - type: table\n    name: Second\n    order: []\n";

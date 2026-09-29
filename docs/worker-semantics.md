@@ -34,7 +34,7 @@ Dates accept exactly `YYYY-MM-DD` or RFC 3339 timestamps with explicit `Z` or nu
 
 `today()` uses the local calendar date from the query's immutable execution environment and encodes it as a date-only value. The worker actor captures the system time and time zone once per request; tests may supply them explicitly. Existing refresh and re-query paths update the environment, but open previews are not scheduled to refresh automatically at midnight.
 
-Natural ordering is locale-independent. ASCII digit runs compare by magnitude without integer conversion, then leading-zero count and bytes. Non-digit text compares case-sensitively by Unicode scalar value. Normalized path bytes provide the final path order. This comparator is used for view sort values, path ties, list sorting, and link fallback selection.
+Natural ordering is locale-independent. ASCII digit runs compare by magnitude without integer conversion, then leading-zero count and bytes. Non-digit text compares case-sensitively by Unicode scalar value. Numeric values compare numerically in relational expressions and when every value in a view sort column or sorted list is numeric. Mixed sort values retain natural ordering; dates and durations retain their type-specific comparisons. Path ties and link fallback selection use natural ordering. Normalized path bytes provide the final path order.
 
 ## Results And Limits
 
