@@ -125,6 +125,7 @@
                     nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/commands-smoke.lua"
                 OBSIDIAN_BASE_WORKER=${worker}/bin/obsidian-base-worker \
                     nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/recovery-smoke.lua"
+                nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/overlay-wipe-smoke.lua"
                 sh "$TMPDIR/obsidian-base.nvim/scripts/architecture-check.sh" \
                   "$TMPDIR/obsidian-base.nvim"
 

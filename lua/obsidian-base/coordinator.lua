@@ -523,7 +523,10 @@ local function overlay_then_query(buffer, generation)
     if not path then return end
     upsert_overlay(workspace, path, table.concat(vim.api.nvim_buf_get_lines(buffer.bufnr, 0, -1, false), "\n"),
         function(error)
-            if error or not vim.api.nvim_buf_is_valid(buffer.bufnr) or buffer.generation ~= generation then
+            -- A late worker response may arrive after BufWipeout has removed
+            -- the buffer, so avoid both source updates and presentation.
+            if not vim.api.nvim_buf_is_valid(buffer.bufnr) then return end
+            if error or buffer.generation ~= generation then
                 if error then for _, source in ipairs(buffer.sources) do source.loading, source.error = false, error end end
                 presenter.sync_buffer(buffer.bufnr)
                 return
