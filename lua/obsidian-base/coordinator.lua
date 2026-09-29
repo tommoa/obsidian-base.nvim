@@ -14,6 +14,7 @@ local crash_history = {}
 ---@type table<string, table<integer, fun(event: table)>>
 local index_subscribers = {}
 local next_index_subscriber = 1
+local maybe_stop_idle_workspace
 -- Defined after source discovery so peer index events can re-query the last
 -- explicit buffer snapshot without uploading current unsaved text.
 local requery_cached_sources
@@ -113,6 +114,7 @@ local function fail_workspace(workspace, error)
     close_pipes(workspace)
     for _, pending in pairs(workspace.pending) do pending.callback(error) end
     workspace.pending = {}
+    maybe_stop_idle_workspace(workspace)
 end
 
 ---Stop a worker and fail every request that is still awaiting a response.
@@ -125,6 +127,20 @@ local function stop_workspace(workspace)
         pending.callback({ code = "worker_stopped", message = "Bases worker stopped" })
     end
     workspace.pending = {}
+end
+
+---Retire a workspace only after its buffers, embed listeners, and asynchronous
+---work have all finished. A callback may create another request or subscriber.
+---@param workspace ObsidianBasesWorkspace
+maybe_stop_idle_workspace = function(workspace)
+    if workspaces[workspace.root] ~= workspace or next(workspace.buffers)
+        or index_subscribers[workspace.root] or next(workspace.pending)
+        or next(workspace.ready_waiters)
+    then
+        return
+    end
+    workspaces[workspace.root] = nil
+    stop_workspace(workspace)
 end
 
 ---Encode and send one request to a ready worker, retaining its response callback.
@@ -146,6 +162,7 @@ local function send(workspace, method, params, callback)
     if not ok then
         workspace.pending[id] = nil
         callback({ code = "encode", message = encoded })
+        maybe_stop_idle_workspace(workspace)
         return
     end
     local wrote, write_error = pcall(workspace.stdin.write, workspace.stdin, encoded .. "\n")
@@ -159,6 +176,7 @@ local function finish_ready_waiters(workspace, error)
     local waiters = workspace.ready_waiters or {}
     workspace.ready_waiters = {}
     for _, waiter in ipairs(waiters) do waiter(error) end
+    maybe_stop_idle_workspace(workspace)
 end
 
 ---Synchronise one buffer overlay only when its contents actually changed.
@@ -235,6 +253,7 @@ local function on_envelope(workspace, line)
         return
     end
     pending.callback(decode_error, result)
+    maybe_stop_idle_workspace(workspace)
 end
 
 ---Return the vault's worker workspace, creating and initialising it when needed.
@@ -281,12 +300,13 @@ local function start_workspace(root)
     }, function(code, signal)
         vim.schedule(function()
             close_pipes(workspace)
+            if workspace.handle and not workspace.handle:is_closing() then workspace.handle:close() end
+            workspace.handle = nil
             if workspace.status == "stopping" then return end
             local message = string.format("worker exited (%s/%s)%s", code, signal,
                 workspace.stderr_tail ~= "" and ": " .. workspace.stderr_tail or "")
             fail_workspace(workspace, { code = "worker_exit", message = message })
             finish_ready_waiters(workspace, { code = "worker_exit", message = message })
-            workspace.handle = nil
             local now = vim.uv.now()
             local crashes = crash_history[root] or {}
             crashes[#crashes + 1] = now
@@ -615,6 +635,7 @@ function M.query_embed(request, callback)
     else
         workspace.ready_waiters[#workspace.ready_waiters + 1] = run
     end
+    maybe_stop_idle_workspace(workspace)
     return cancel
 end
 
@@ -635,6 +656,8 @@ function M.subscribe_index(root, callback)
         if not subscribers then return end
         subscribers[id] = nil
         if not next(subscribers) then index_subscribers[root] = nil end
+        local workspace = workspaces[root]
+        if workspace then maybe_stop_idle_workspace(workspace) end
     end
 end
 
@@ -650,9 +673,10 @@ end
 
 ---Release a buffer's workspace membership and its overlay at the bound path.
 ---@param buffer ObsidianBasesBuffer
-local function detach_buffer(buffer)
+---@param retaining? boolean Keep membership during a same-vault filename change.
+local function detach_buffer(buffer, retaining)
     local workspace, path = buffer.workspace, buffer.path
-    workspace.buffers[buffer.bufnr] = nil
+    if not retaining then workspace.buffers[buffer.bufnr] = nil end
     if path then
         workspace.overlays[path] = nil
         if workspace.status == "ready" then
@@ -662,18 +686,22 @@ local function detach_buffer(buffer)
         end
     end
     clear_sources(buffer)
+    if not retaining then maybe_stop_idle_workspace(workspace) end
 end
 
 ---Attach an eligible vault buffer to its worker workspace and begin previewing Bases.
 ---@param bufnr integer
 function M.attach(bufnr)
     if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then return end
+    local buffer = buffers[bufnr]
     local path = vim.api.nvim_buf_get_name(bufnr)
-    if path == "" then return end
+    if path == "" then
+        if buffer then detach_buffer(buffer); buffers[bufnr] = nil end
+        return
+    end
     local eligible = vim.bo[bufnr].filetype == "markdown" or vim.bo[bufnr].filetype == "obsidian_base" or
         path:sub(-5) == ".base"
     local root = eligible and vault_root(path)
-    local buffer = buffers[bufnr]
     if not root then
         if buffer then
             detach_buffer(buffer)
@@ -685,7 +713,7 @@ function M.attach(bufnr)
     if not relative_path then return end
     local workspace = start_workspace(root)
     if buffer and buffer.root == root and buffer.path == relative_path and buffer.workspace == workspace then return end
-    if buffer then detach_buffer(buffer) end
+    if buffer then detach_buffer(buffer, buffer.workspace == workspace) end
     buffer = buffer or { bufnr = bufnr, enabled = true, generation = 0 }
     buffer.root, buffer.path, buffer.workspace = root, relative_path, workspace
     buffers[bufnr], workspace.buffers[bufnr] = buffer, true
@@ -905,7 +933,8 @@ function M.setup()
         callback = function(args)
             local buffer = buffers[args.buf]
             if not buffer then return end
-            detach_buffer(buffer)
+            -- BufFilePost reattaches this buffer, possibly to the same vault.
+            detach_buffer(buffer, true)
             buffer.path = nil
         end,
     })

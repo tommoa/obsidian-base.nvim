@@ -118,6 +118,8 @@
                 OBSIDIAN_BASE_WORKER=${worker}/bin/obsidian-base-worker \
                     nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/worker-smoke.lua"
                 OBSIDIAN_BASE_WORKER=${worker}/bin/obsidian-base-worker \
+                    nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/lifecycle-smoke.lua"
+                OBSIDIAN_BASE_WORKER=${worker}/bin/obsidian-base-worker \
                     nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/verify-cli-goldens.lua" \
                     "$TMPDIR/obsidian-base.nvim/fixtures/cli-capture.json" \
                     "$TMPDIR/obsidian-base.nvim/fixtures/vault"
