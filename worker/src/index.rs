@@ -13,7 +13,7 @@ use crate::{
     error::{Result, WorkerError},
     limits::Limits,
     markdown::markdown_metadata,
-    path::lexical_contained,
+    path::{canonical_contained, lexical_contained},
     protocol::MetadataOverrideParams,
     value::{DataValue, natural_cmp, parse_date},
     yaml::parse_mapping,
@@ -387,7 +387,11 @@ fn frontmatter(contents: &str, limits: Limits) -> (BTreeMap<String, DataValue>, 
 }
 
 fn load_property_types(root: &Path, limits: Limits) -> Result<HashMap<String, String>> {
-    let path = root.join(".obsidian/types.json");
+    let path = match canonical_contained(root, ".obsidian/types.json") {
+        Ok(path) => path,
+        Err(error) if error.code == "ENOENT" => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
+    };
     let source = match limits.read_text(&path) {
         Ok(source) => source,
         Err(error) if error.code == "ENOENT" => return Ok(HashMap::new()),

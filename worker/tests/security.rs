@@ -70,6 +70,28 @@ fn rejects_symlinked_sources_outside_the_vault() {
     assert_eq!(error.code, "path_outside_vault");
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_symlinked_property_types_outside_the_vault() {
+    use std::os::unix::fs::symlink;
+
+    let parent = TempDir::new().unwrap();
+    let root = parent.path().join("vault");
+    host(&root);
+    let outside = parent.path().join("types.json");
+    fs::write(&outside, "{\"types\":{\"date\":\"date\"}}").unwrap();
+    symlink(&outside, root.join(".obsidian/types.json")).unwrap();
+
+    let error = WorkerService::new()
+        .initialize(InitialiseParams {
+            vault_root: root.to_string_lossy().into_owned(),
+            metadata_overrides: BTreeMap::new(),
+            limits: LimitsPatch::default(),
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "path_outside_vault");
+}
+
 #[test]
 fn failed_rescan_preserves_generation_and_cached_rows() {
     let root = TempDir::new().unwrap();
