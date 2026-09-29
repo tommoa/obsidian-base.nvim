@@ -134,6 +134,58 @@ fn rejects_zero_limit_overrides() {
     assert_eq!(output[0]["response"]["error"]["code"], "invalid_request");
 }
 
+#[test]
+fn request_line_limit_preserves_framing_and_recovery() {
+    const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024 * 1024;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_obsidian-base-worker"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        let inspect = request(1, "inspect", json!({})).to_string();
+        assert!(inspect.len() < MAX_REQUEST_LINE_BYTES);
+        stdin.write_all(inspect.as_bytes()).unwrap();
+        stdin
+            .write_all(&vec![b' '; MAX_REQUEST_LINE_BYTES - inspect.len()])
+            .unwrap();
+        stdin.write_all(b"\n").unwrap();
+
+        stdin.write_all(inspect.as_bytes()).unwrap();
+        stdin
+            .write_all(&vec![b' '; MAX_REQUEST_LINE_BYTES - inspect.len()])
+            .unwrap();
+        stdin.write_all(b"\r\n").unwrap();
+
+        stdin.write_all(inspect.as_bytes()).unwrap();
+        stdin
+            .write_all(&vec![b' '; MAX_REQUEST_LINE_BYTES + 1 - inspect.len()])
+            .unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.write_all(b"\xff\n").unwrap();
+        writeln!(stdin, "{}", request(2, "shutdown", json!({}))).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let envelopes: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(envelopes.len(), 5);
+    assert_eq!(envelopes[0]["id"], 1);
+    assert_eq!(envelopes[0]["response"]["type"], "success");
+    assert_eq!(envelopes[1]["id"], 1);
+    assert_eq!(envelopes[1]["response"]["type"], "success");
+    assert_eq!(envelopes[2]["id"], 0);
+    assert_eq!(envelopes[2]["response"]["error"]["code"], "invalid_request");
+    assert_eq!(envelopes[3]["id"], 0);
+    assert_eq!(envelopes[3]["response"]["error"]["code"], "invalid_request");
+    assert_eq!(envelopes[4]["id"], 2);
+    assert_eq!(envelopes[4]["response"]["result"]["method"], "shutdown");
+}
+
 fn run(requests: &[Value]) -> Vec<Value> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_obsidian-base-worker"))
         .stdin(Stdio::piped())

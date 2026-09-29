@@ -2,6 +2,9 @@
 
 The worker reads and writes UTF-8 JSON Lines. Each line is one JSON object.
 Stdout contains protocol envelopes only; diagnostics go to stderr.
+Request lines may contain up to 8 MiB of bytes, excluding the line ending (`\n`
+or `\r\n`). Longer lines receive `invalid_request`; the worker discards the
+rest of that line and continues reading subsequent requests.
 
 The protocol is closed. Envelope, request, parameter, event, and response
 objects reject unknown fields. Numeric IDs must be non-negative integers that

@@ -21,6 +21,8 @@ use crate::{
 pub enum ActorMessage {
     /// One raw JSON-lines protocol request read from standard input.
     Line(String),
+    /// A framing error for a line that cannot be decoded as a request.
+    InvalidLine(&'static str),
     /// A relevant filesystem change reported by the vault watcher.
     Watch(WatchMessage),
     /// End of standard input, which terminates the worker process.
@@ -82,6 +84,9 @@ impl WorkerActor {
                     if !self.handle_line(&line).await {
                         break;
                     }
+                }
+                Some(ActorMessage::InvalidLine(message)) => {
+                    self.send_error(RequestId::INVALID, "invalid_request", message);
                 }
                 Some(ActorMessage::Watch(WatchMessage::Changed(paths))) => {
                     for path in paths {
