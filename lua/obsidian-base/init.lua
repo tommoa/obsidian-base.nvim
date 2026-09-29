@@ -63,12 +63,14 @@ function M.refresh(bufnr) coordinator.refresh(bufnr or vim.api.nvim_get_current_
 ---Prompt for a Base view and refresh the selected source with it.
 ---@param bufnr? integer
 ---@param source_id? string
-function M.select_view(bufnr, source_id) ui.select_view(bufnr or vim.api.nvim_get_current_buf(), source_id) end
+---@param row? integer Zero-based request row when invoked from a code action.
+function M.select_view(bufnr, source_id, row) ui.select_view(bufnr or vim.api.nvim_get_current_buf(), source_id, row) end
 
 ---Open the complete cached result set for a Base source in obsidian.nvim's picker.
 ---@param bufnr? integer
 ---@param source_id? string
-function M.open_results(bufnr, source_id) ui.open_results(bufnr or vim.api.nvim_get_current_buf(), source_id) end
+---@param row? integer Zero-based request row when invoked from a code action.
+function M.open_results(bufnr, source_id, row) ui.open_results(bufnr or vim.api.nvim_get_current_buf(), source_id, row) end
 
 ---@class ObsidianBaseFoldOptions
 ---@field level? integer Absolute fold level for Base sources.

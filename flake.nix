@@ -123,6 +123,7 @@
                     "$TMPDIR/obsidian-base.nvim/fixtures/vault"
                 OBSIDIAN_BASE_WORKER=${worker}/bin/obsidian-base-worker \
                     nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/commands-smoke.lua"
+                nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/code-action-smoke.lua"
                 OBSIDIAN_BASE_WORKER=${worker}/bin/obsidian-base-worker \
                     nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/recovery-smoke.lua"
                 nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/overlay-wipe-smoke.lua"

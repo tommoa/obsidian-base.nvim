@@ -66,7 +66,6 @@ local augroup = vim.api.nvim_create_augroup("obsidian-base", { clear = true })
 ---@field enabled boolean
 ---@field generation integer
 ---@field sources ObsidianBasesSource[]
----@field code_action_row? integer
 
 ---Find the canonical vault root containing a filesystem path.
 ---@param path string
@@ -768,13 +767,10 @@ function M.source_at_cursor(bufnr, row)
     local buffer = buffers[bufnr]
     if not buffer then return nil end
     if row == nil then
-        row = buffer.code_action_row
-        if row == nil then
-            local wins = vim.fn.win_findbuf(bufnr)
-            local win = vim.api.nvim_get_current_win()
-            if vim.api.nvim_win_get_buf(win) ~= bufnr then win = wins[1] end
-            row = win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_cursor(win)[1] - 1 or nil
-        end
+        local wins = vim.fn.win_findbuf(bufnr)
+        local win = vim.api.nvim_get_current_win()
+        if vim.api.nvim_win_get_buf(win) ~= bufnr then win = wins[1] end
+        row = win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_cursor(win)[1] - 1 or nil
     end
     if row == nil then return nil end
     for _, source in ipairs(buffer.sources) do
@@ -883,20 +879,6 @@ function M.code_actions_available(bufnr)
         if client.name == "obsidian-ls" then return true end
     end
     return false
-end
-
----Remember the buffer/cursor that requested a code action before its deferred
----LSP command runs and focus moves into a picker or code-action window.
----@param bufnr integer
-function M.remember_code_action_context(bufnr)
-    local buffer = buffers[bufnr]
-    if not buffer then return end
-    for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
-        if vim.api.nvim_win_get_buf(win) == bufnr then
-            buffer.code_action_row = vim.api.nvim_win_get_cursor(win)[1] - 1
-            return
-        end
-    end
 end
 
 ---Return mutable state for the presenter; this is not part of the public plugin API.

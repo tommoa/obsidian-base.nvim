@@ -12,9 +12,10 @@ end
 
 ---@param bufnr integer
 ---@param callback fun(source_id: string)
+---@param row? integer Zero-based request row, if the picker has taken focus.
 ---Choose the source at the cursor, or prompt when the buffer has several sources.
-local function choose_source(bufnr, callback)
-  local source_id = coordinator.source_at_cursor(bufnr)
+local function choose_source(bufnr, callback, row)
+  local source_id = coordinator.source_at_cursor(bufnr, row)
   if source_id then
     callback(source_id)
     return
@@ -35,8 +36,9 @@ end
 
 ---@param bufnr? integer
 ---@param source_id? string
+---@param row? integer Zero-based request row.
 ---Prompt for and apply a named view to a Base source.
-function M.select_view(bufnr, source_id)
+function M.select_view(bufnr, source_id, row)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local function select(id)
     if source_id and id ~= source_id then return end
@@ -66,14 +68,15 @@ function M.select_view(bufnr, source_id)
     end
     warn("Base source is no longer available")
   else
-    choose_source(bufnr, select)
+    choose_source(bufnr, select, row)
   end
 end
 
 ---@param bufnr? integer
 ---@param source_id? string
+---@param row? integer Zero-based request row.
 ---Fetch every result row for a source and present it through the configured picker.
-function M.open_results(bufnr, source_id)
+function M.open_results(bufnr, source_id, row)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local function open(id)
     if source_id and id ~= source_id then return end
@@ -118,7 +121,7 @@ function M.open_results(bufnr, source_id)
     end
     warn("Base source is no longer available")
   else
-    choose_source(bufnr, open)
+    choose_source(bufnr, open, row)
   end
 end
 

@@ -1,9 +1,8 @@
 -- Integrates Obsidian Bases actions with obsidian.nvim's command and LSP action APIs.
 local M = {}
 local installed = false
-local code_action_bufnr
 
----Return the buffer that should receive an Obsidian command or code action.
+---Return the buffer that should receive an Obsidian command.
 ---@return integer bufnr
 local function current_buf()
     return vim.api.nvim_get_current_buf()
@@ -45,29 +44,34 @@ function M.setup()
     local actions = {
         { "bases_toggle",  "Toggle Base previews",  function(bases, bufnr) bases.toggle(bufnr) end },
         { "bases_refresh", "Refresh Base previews", function(bases, bufnr) bases.refresh(bufnr) end },
-        { "bases_view",    "Select Base view",      function(bases, bufnr) bases.select_view(bufnr) end },
-        { "bases_results", "Open Base results",     function(bases, bufnr) bases.open_results(bufnr) end },
+        { "bases_view",    "Select Base view",      function(bases, bufnr, source_id, row) bases.select_view(bufnr, source_id, row) end },
+        { "bases_results", "Open Base results",     function(bases, bufnr, source_id, row) bases.open_results(bufnr, source_id, row) end },
         { "bases_inspect", "Inspect Base preview",  function(bases, bufnr) bases.inspect(bufnr) end },
     }
     for _, action in ipairs(actions) do
         obsidian.code_action.add({
             name = action[1],
             title = action[2],
-            cond = function()
-                local bufnr = current_buf()
+            cond = function(_, params)
+                local bufnr = vim.uri_to_bufnr(params.textDocument.uri)
                 local coordinator = require("obsidian-base.coordinator")
-                if not coordinator.code_actions_available(bufnr) then return false end
-                code_action_bufnr = bufnr
-                coordinator.remember_code_action_context(bufnr)
-                return true
+                return coordinator.code_actions_available(bufnr)
             end,
-            fn = function()
-                local bufnr = code_action_bufnr
+            -- obsidian.nvim resolves arguments for each request before its
+            -- scheduled command runs, so overlapping requests keep their context.
+            arguments = function(_, params)
+                local bufnr = vim.uri_to_bufnr(params.textDocument.uri)
+                local row = params.range.start.line
+                local source_id = require("obsidian-base.coordinator").source_at_cursor(bufnr, row)
+                -- Keep the row in the third slot when no source is under the cursor.
+                return { bufnr, source_id or false, row }
+            end,
+            fn = function(bufnr, source_id, row)
                 if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
                     vim.notify("Obsidian Bases: code-action buffer is no longer available", vim.log.levels.WARN)
                     return
                 end
-                action[3](require("obsidian-base"), bufnr)
+                action[3](require("obsidian-base"), bufnr, source_id ~= false and source_id or nil, row)
             end,
         })
     end
