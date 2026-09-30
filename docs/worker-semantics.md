@@ -6,7 +6,9 @@ Initialization canonicalizes the vault root. Traversal uses sorted `read_dir` re
 
 Markdown frontmatter is optional. Invalid note frontmatter removes only that note's properties; it does not fail the scan. Tags combine frontmatter tags and prose tags with deduplication. Wiki links are extracted from prose, excluding code and HTML. Backlinks are built after every candidate record exists. Link resolution prefers a source-relative target and then a naturally sorted basename match.
 
-Overlays replace disk text and can create supported overlay-only records. Their creation timestamp survives updates. A complete candidate index, backlinks included, is published in one transaction. Failed scans preserve records, generation, overlays, and cached query rows. Successful publication increments generation and clears every result cache entry.
+Overlays replace disk text and can create supported overlay-only records. Their creation timestamp survives updates. Named ordinary-file updates reuse unchanged records and reread only the affected paths. Property types are checked on every update; changes to `.obsidian/types.json` require a full scan. Backlinks are cleared and rebuilt across the complete candidate, so adding or removing a target can redirect links from unchanged notes. A complete candidate index, backlinks included, is published in one transaction. Failed scans preserve records, generation, overlays, and cached query rows. Successful publication increments generation and clears every result cache entry.
+
+After a failed watcher update, the next update requires a full scan so that other changes in the rejected batch are recovered. The failed update preserves the published snapshot and cached results until that scan succeeds.
 
 Non-UTF-8 paths are omitted. `inspect` reports their total and a bounded redacted sample; raw invalid filename bytes never enter JSON.
 
@@ -14,7 +16,7 @@ Non-UTF-8 paths are omitted. `inspect` reports their total and a bounded redacte
 
 File Base sources are lexical vault-relative paths. Existing disk sources are canonicalized after symlink resolution and must remain under the canonical root. Overlay sources use the same lexical boundary.
 
-One recursive notify watcher treats events as invalidation hints. `.git`, `.trash`, and ordinary `.obsidian` events are ignored, while `.obsidian/types.json` is retained. Relevant events are coalesced for 100 ms into one full transactional rescan. Watch errors and failed rescans never make the published index unavailable.
+One recursive notify watcher treats events as invalidation hints. `.git`, `.trash`, and ordinary `.obsidian` events are ignored, while `.obsidian/types.json` is retained. Relevant events are coalesced for 100 ms into one transactional update. Precise file creation, removal, and data/metadata changes refresh named ordinary files. Ambiguous events, renames, directories, unrepresentable paths, backend rescan requests, and batches exceeding eight paths use a full rescan. An empty path in `index_changed.paths` means the watcher cannot retain a complete named change set and requires a full scan. Named hints can also trigger full scans: symlink, excluded, and metadata-type paths fall back to the scanner, which retains its traversal rules. Watch errors and failed rescans never make the published index unavailable.
 
 ## YAML And Expressions
 

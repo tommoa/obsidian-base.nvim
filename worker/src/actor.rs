@@ -43,7 +43,7 @@ pub struct WorkerActor {
     output: mpsc::UnboundedSender<WorkerEnvelope>,
     /// Active watcher handle, retained to keep observation of the current vault alive.
     watcher: Option<VaultWatcher>,
-    /// Bounded set of changed paths accumulated during the debounce window.
+    /// At most eight changed paths, or an empty-string sentinel requiring a full rescan.
     pending_paths: BTreeSet<String>,
     /// Deadline for publishing the next coalesced filesystem rescan.
     deadline: Option<Instant>,
@@ -89,12 +89,7 @@ impl WorkerActor {
                     self.send_error(RequestId::INVALID, "invalid_request", message);
                 }
                 Some(ActorMessage::Watch(WatchMessage::Changed(paths))) => {
-                    for path in paths {
-                        if self.pending_paths.len() == 8 {
-                            break;
-                        }
-                        self.pending_paths.insert(path);
-                    }
+                    self.remember_watch_paths(paths);
                     self.deadline = Some(Instant::now() + Duration::from_millis(100));
                 }
                 Some(ActorMessage::Watch(WatchMessage::Error(error))) => {
@@ -102,6 +97,24 @@ impl WorkerActor {
                 }
                 Some(ActorMessage::Eof) | None => break,
             }
+        }
+    }
+
+    /// Coalesce paths without losing changes when the bounded notification list fills.
+    /// A full-rescan sentinel remains authoritative until the debounce batch is flushed.
+    fn remember_watch_paths(&mut self, paths: Vec<String>) {
+        if self.pending_paths.contains("") {
+            return;
+        }
+        for path in paths {
+            if path.is_empty()
+                || (self.pending_paths.len() == 8 && !self.pending_paths.contains(&path))
+            {
+                self.pending_paths.clear();
+                self.pending_paths.insert(String::new());
+                return;
+            }
+            self.pending_paths.insert(path);
         }
     }
 
@@ -220,5 +233,42 @@ impl WorkerActor {
         .expect("worker blocking task panicked");
         self.service = service;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn actor() -> WorkerActor {
+        let (input, _) = mpsc::channel(1);
+        let (output, _) = mpsc::unbounded_channel();
+        WorkerActor::new(input, output)
+    }
+
+    #[test]
+    fn overflow_requests_a_sticky_full_rescan() {
+        let mut actor = actor();
+        actor.remember_watch_paths((0..9).map(|i| format!("{i}.md")).collect());
+        assert_eq!(actor.pending_paths, BTreeSet::from([String::new()]));
+        actor.remember_watch_paths(vec!["later.md".into()]);
+        assert_eq!(actor.pending_paths, BTreeSet::from([String::new()]));
+    }
+
+    #[test]
+    fn duplicate_paths_do_not_overflow_a_full_notification_list() {
+        let mut actor = actor();
+        let paths = (0..8).map(|i| format!("{i}.md")).collect::<Vec<_>>();
+        actor.remember_watch_paths(paths.clone());
+        actor.remember_watch_paths(paths.clone());
+        assert_eq!(actor.pending_paths, paths.into_iter().collect());
+    }
+
+    #[test]
+    fn late_sentinel_overrides_a_full_notification_list() {
+        let mut actor = actor();
+        actor.remember_watch_paths((0..8).map(|i| format!("{i}.md")).collect());
+        actor.remember_watch_paths(vec!["0.md".into(), String::new(), "later.md".into()]);
+        assert_eq!(actor.pending_paths, BTreeSet::from([String::new()]));
     }
 }

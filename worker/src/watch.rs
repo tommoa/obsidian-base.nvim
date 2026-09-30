@@ -2,12 +2,15 @@
 
 use std::path::Path;
 
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{CreateKind, ModifyKind, RemoveKind},
+};
 use tokio::sync::mpsc;
 
 /// Change or error notification delivered from the filesystem watcher to the actor.
 pub enum WatchMessage {
-    /// Relevant vault-relative paths that should trigger a reindex.
+    /// Relevant vault-relative paths, or an empty-string sentinel requiring a full rescan.
     Changed(Vec<String>),
     /// Diagnostic emitted when the watcher backend reports a failure.
     Error(String),
@@ -43,19 +46,41 @@ impl VaultWatcher {
 
 fn relevant_paths(root: &Path, event: Event) -> Option<Vec<String>> {
     let needs_rescan = event.need_rescan();
-    let mut paths = event
-        .paths
-        .into_iter()
-        .filter_map(|path| relative(root, &path))
-        .filter(|path| relevant(path))
-        .collect::<Vec<_>>();
+    // Backend overflow is authoritative even when the event includes a few named paths.
+    // The empty path tells the index that unchanged records cannot safely be reused.
+    if needs_rescan {
+        return Some(vec![String::new()]);
+    }
+    if matches!(event.kind, EventKind::Access(_)) {
+        return None;
+    }
+    let precise = matches!(
+        event.kind,
+        EventKind::Create(CreateKind::File)
+            | EventKind::Remove(RemoveKind::File)
+            | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_))
+    );
+    let mut uncertain = event.paths.is_empty();
+    let mut paths = Vec::new();
+    for path in event.paths {
+        match relative(root, &path) {
+            Some(path) if relevant(&path) => paths.push(path),
+            // A directory-level event can add/remove the otherwise included types registry.
+            Some(path) if !precise && path == ".obsidian" => uncertain = true,
+            Some(_) => (),
+            None => uncertain = true,
+        }
+    }
+    if paths.is_empty() && !uncertain {
+        return None;
+    }
+    // Directories, renames, and backend-specific kinds may affect descendants or omit
+    // a rename endpoint. Unnamed/non-UTF-8 paths likewise cannot identify reusable records.
+    if uncertain || !precise {
+        return Some(vec![String::new()]);
+    }
     paths.sort();
     paths.dedup();
-    if paths.is_empty() && needs_rescan {
-        // An empty path is the actor's sentinel for a full rescan when notify cannot name the
-        // affected files (for example after an overflowed backend event queue).
-        paths.push(String::new());
-    }
     Some(paths)
 }
 
@@ -73,4 +98,113 @@ fn relevant(path: &str) -> bool {
     !path
         .split('/')
         .any(|component| [".git", ".obsidian", ".trash"].contains(&component))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{AccessKind, DataChange, Flag, MetadataKind, RenameMode};
+
+    fn named(kind: EventKind, path: &str) -> Event {
+        Event::new(kind).add_path(Path::new("/vault").join(path))
+    }
+
+    fn filtered(event: Event) -> Option<Vec<String>> {
+        relevant_paths(Path::new("/vault"), event)
+    }
+
+    #[test]
+    fn rescan_flag_overrides_named_and_excluded_paths() {
+        for path in ["Task.md", ".git/index"] {
+            assert_eq!(
+                filtered(
+                    named(EventKind::Modify(ModifyKind::Data(DataChange::Any)), path)
+                        .set_flag(Flag::Rescan)
+                ),
+                Some(vec![String::new()])
+            );
+        }
+    }
+
+    #[test]
+    fn precise_file_events_keep_sorted_unique_paths() {
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+        ] {
+            let event = named(kind, "B.md")
+                .add_path(Path::new("/vault/A.md").to_owned())
+                .add_path(Path::new("/vault/B.md").to_owned());
+            assert_eq!(filtered(event), Some(vec!["A.md".into(), "B.md".into()]));
+        }
+    }
+
+    #[test]
+    fn ambiguous_directory_and_rename_events_require_full_rescan() {
+        for kind in [
+            EventKind::Any,
+            EventKind::Other,
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Remove(RemoveKind::Folder),
+            EventKind::Create(CreateKind::Any),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+        ] {
+            assert_eq!(filtered(named(kind, "Notes")), Some(vec![String::new()]));
+            assert_eq!(
+                filtered(named(kind, ".obsidian")),
+                Some(vec![String::new()])
+            );
+        }
+    }
+
+    #[test]
+    fn unnamed_and_unrepresentable_changes_require_full_rescan() {
+        let kind = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert_eq!(filtered(Event::new(kind)), Some(vec![String::new()]));
+        assert_eq!(
+            filtered(Event::new(kind).add_path(Path::new("/outside/Task.md").to_owned())),
+            Some(vec![String::new()])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_require_full_rescan() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let path = Path::new("/vault").join(OsString::from_vec(vec![0xff]));
+        assert_eq!(
+            filtered(Event::new(EventKind::Create(CreateKind::File)).add_path(path)),
+            Some(vec![String::new()])
+        );
+    }
+
+    #[test]
+    fn access_and_ordinary_excluded_events_are_ignored() {
+        assert_eq!(
+            filtered(Event::new(EventKind::Access(AccessKind::Any))),
+            None
+        );
+        assert_eq!(
+            filtered(named(EventKind::Access(AccessKind::Any), "Task.md")),
+            None
+        );
+        for kind in [EventKind::Any, EventKind::Create(CreateKind::File)] {
+            for path in [".git/index", ".obsidian/workspace.json", ".trash/Task.md"] {
+                assert_eq!(filtered(named(kind, path)), None);
+            }
+        }
+        assert_eq!(
+            filtered(named(
+                EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                ".obsidian/types.json"
+            )),
+            Some(vec![".obsidian/types.json".into()])
+        );
+    }
 }

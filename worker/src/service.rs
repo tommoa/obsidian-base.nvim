@@ -41,12 +41,14 @@ struct InitializedService {
     result_sequence: u64,
     results: HashMap<String, Vec<ResultRow>>,
     watcher_errors: Vec<String>,
+    /// A rejected watcher batch may contain changes absent from later named hints.
+    needs_rescan: bool,
 }
 
 impl InitializedService {
-    fn build(&self, overlays: &BTreeMap<String, Overlay>) -> Result<Index> {
-        Index::build(
-            self.root.clone(),
+    fn refresh(&self, paths: &[String], overlays: &BTreeMap<String, Overlay>) -> Result<Index> {
+        self.index.refresh(
+            if self.needs_rescan { &[] } else { paths },
             overlays,
             &self.metadata,
             self.limits,
@@ -58,6 +60,7 @@ impl InitializedService {
         self.index = index;
         self.generation += 1;
         self.results.clear();
+        self.needs_rescan = false;
     }
 
     fn read_source(&self, path: &str) -> Result<String> {
@@ -177,6 +180,7 @@ impl WorkerService {
             result_sequence: 0,
             results: HashMap::new(),
             watcher_errors,
+            needs_rescan: false,
         });
         Ok(InitializeResult {
             generation: generation + 1,
@@ -278,7 +282,7 @@ impl WorkerService {
                     created_at,
                 },
             );
-            let index = state.build(&overlays)?;
+            let index = state.refresh(std::slice::from_ref(&path), &overlays)?;
             state.overlays = overlays;
             state.publish(index);
             state.generation
@@ -296,7 +300,7 @@ impl WorkerService {
             let state = self.initialized_mut()?;
             let mut overlays = state.overlays.clone();
             overlays.remove(&path);
-            let index = state.build(&overlays)?;
+            let index = state.refresh(std::slice::from_ref(&path), &overlays)?;
             state.overlays = overlays;
             state.publish(index);
             state.generation
@@ -307,10 +311,18 @@ impl WorkerService {
         })
     }
 
-    /// Rebuild after coalesced external filesystem notifications.
+    /// Refresh named files or rescan ambiguous coalesced filesystem notifications.
     pub fn reindex_external(&mut self, paths: Vec<String>) -> Result<IndexChange> {
         let state = self.initialized_mut()?;
-        let index = state.build(&state.overlays)?;
+        let index = match state.refresh(&paths, &state.overlays) {
+            Ok(index) => index,
+            Err(error) => {
+                // The actor consumes this batch even on failure. Retry all disk changes
+                // at the next publication rather than losing its other named paths.
+                state.needs_rescan = true;
+                return Err(error);
+            }
+        };
         state.publish(index);
         Ok(IndexChange {
             generation: state.generation,

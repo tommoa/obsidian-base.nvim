@@ -25,7 +25,7 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
 ];
 const DIAGNOSTIC_SAMPLE: usize = 8;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 /// Indexed metadata and relationship data for one supported vault file.
 pub struct FileRecord {
     /// Vault-relative path using forward slashes.
@@ -81,6 +81,8 @@ pub struct Index {
     pub records: BTreeMap<String, FileRecord>,
     /// Non-fatal observations made while scanning the vault.
     pub diagnostics: Diagnostics,
+    /// Property coercions used by these records; a changed schema requires a full scan.
+    property_types: HashMap<String, String>,
 }
 
 impl Index {
@@ -89,6 +91,7 @@ impl Index {
             root,
             records: BTreeMap::new(),
             diagnostics: Diagnostics::default(),
+            property_types: HashMap::new(),
         }
     }
 
@@ -124,7 +127,105 @@ impl Index {
             root,
             records: builder.records,
             diagnostics: builder.diagnostics,
+            property_types: builder.property_types,
         })
+    }
+
+    /// Build a transactional candidate by rereading only named ordinary files.
+    ///
+    /// Directory, symlink, excluded, and unnamed hints fall back to a full scan.
+    /// Backlinks are rebuilt over the complete candidate because adding or removing
+    /// a target can change resolution of links in otherwise unchanged notes.
+    /// Named hints must cover every changed overlay and file; metadata overrides
+    /// and limits must match the original build. Use an empty hint list to rescan
+    /// when those inputs change or the complete change set is unknown.
+    pub fn refresh(
+        &self,
+        paths: &[String],
+        overlays: &BTreeMap<String, Overlay>,
+        metadata_overrides: &HashMap<String, MetadataOverride>,
+        limits: Limits,
+        watcher_errors: Vec<String>,
+    ) -> Result<Self> {
+        let property_types = load_property_types(&self.root, limits)?;
+        let mut ordinary_files = !paths.is_empty() && property_types == self.property_types;
+        for path in paths {
+            if !self.ordinary_file_hint(path)? {
+                ordinary_files = false;
+                break;
+            }
+        }
+        if !ordinary_files {
+            return Self::build(
+                self.root.clone(),
+                overlays,
+                metadata_overrides,
+                limits,
+                watcher_errors,
+            );
+        }
+        let mut builder = Builder {
+            root: self.root.clone(),
+            overlays,
+            metadata_overrides,
+            property_types,
+            limits,
+            records: self.records.clone(),
+            diagnostics: self.diagnostics.clone(),
+        };
+        builder.diagnostics.watcher_errors = watcher_errors;
+        for path in paths {
+            builder.records.remove(path);
+            // A deletion restores an overlay if present, otherwise removes the record.
+            match builder.index(path) {
+                Err(error) if error.code == "ENOENT" => {}
+                result => result?,
+            }
+        }
+        builder.build_backlinks();
+        Ok(Self {
+            root: self.root.clone(),
+            records: builder.records,
+            diagnostics: builder.diagnostics,
+            property_types: builder.property_types,
+        })
+    }
+
+    /// Recognize paths whose refresh cannot silently miss a changed subtree.
+    fn ordinary_file_hint(&self, path: &str) -> Result<bool> {
+        if !supported(path)
+            || path
+                .split('/')
+                .any(|part| ["", ".", "..", ".git", ".obsidian", ".trash"].contains(&part))
+            || path.contains('\\')
+        {
+            return Ok(false);
+        }
+        // A removed directory may have a supported extension too.
+        let prefix = format!("{path}/");
+        if self
+            .records
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|(key, _)| key.starts_with(&prefix))
+        {
+            return Ok(false);
+        }
+        let absolute = lexical_contained(&self.root, path)?;
+        let mut current = self.root.clone();
+        for component in Path::new(path).components() {
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if current == absolute => return Ok(metadata.is_file()),
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(current == absolute);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(false)
     }
 
     /// Resolve relative paths or natural-order basename matches against current records.
@@ -353,6 +454,9 @@ impl Builder<'_> {
     }
 
     fn build_backlinks(&mut self) {
+        for record in self.records.values_mut() {
+            record.backlinks.clear();
+        }
         // All disk and overlay records exist now. Keep one natural-order winner per
         // basename so fallback hits and misses do not scan the vault for each link.
         let mut basename_targets: HashMap<String, String> = HashMap::new();

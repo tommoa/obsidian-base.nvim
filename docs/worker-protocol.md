@@ -43,7 +43,12 @@ Index changes use:
 Every request receives one response, including `shutdown`; the worker exits
 after emitting the shutdown acknowledgement. Successful overlay mutations emit
 `index_changed` with `origin: "overlay"` before their matching response.
-Watcher rescans emit the same event with `origin: "watch"`.
+Watcher updates emit the same event with `origin: "watch"`. Their `paths`
+contain the coalesced file hints, or `[""]` when the watcher cannot retain
+a complete named change set. The index may also perform a full scan for
+named hints, such as a property-type change or symlink path. Every
+publication still invalidates all cached result IDs; these paths describe
+change hints, not the scan strategy or query dependencies.
 
 ## Methods
 
