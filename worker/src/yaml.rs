@@ -79,6 +79,32 @@ impl EventReceiver for SafetyReceiver {
 }
 
 impl SafetyReceiver {
+    /// Validate collected safety errors in their established priority order.
+    fn check(&self) -> Result<()> {
+        if self.unsafe_feature {
+            return Err(WorkerError::new(
+                "unsafe_yaml",
+                "YAML aliases and tags are not supported",
+            ));
+        }
+        if self.documents != 1 {
+            return Err(WorkerError::new(
+                "yaml_parse",
+                "exactly one YAML document is required",
+            ));
+        }
+        if self.duplicate {
+            return Err(WorkerError::new("yaml_parse", "duplicate mapping key"));
+        }
+        if self.complex_key {
+            return Err(WorkerError::new(
+                "yaml_parse",
+                "complex mapping keys are not supported",
+            ));
+        }
+        Ok(())
+    }
+
     fn scalar(&mut self, value: String) {
         if let Some(Container::Mapping {
             expecting_key,
@@ -107,33 +133,54 @@ impl SafetyReceiver {
     }
 }
 
+/// Parse one mapping with the root at depth zero and scalar keys uncounted.
+/// Over-limit values stop the event scan; previously observed safety errors
+/// retain their priority, while diagnostics in the unread suffix are skipped.
 pub fn parse_mapping(text: &str, limits: Limits) -> Result<BTreeMap<String, DataValue>> {
     limits.check_text(text)?;
     let mut receiver = SafetyReceiver::default();
-    Parser::new_from_str(text)
-        .load(&mut receiver, true)
-        .map_err(|error| WorkerError::new("yaml_parse", error.to_string()))?;
-    if receiver.unsafe_feature {
-        return Err(WorkerError::new(
-            "unsafe_yaml",
-            "YAML aliases and tags are not supported",
-        ));
+    // `Parser::load` recursively visits collections, so even the safety pass
+    // must consume events incrementally and stop before descending too far.
+    let mut parser = Parser::new_from_str(text);
+    loop {
+        let (event, _) = parser
+            .next_token()
+            .map_err(|error| WorkerError::new("yaml_parse", error.to_string()))?;
+        // The root is depth zero; open containers count the depth of the next
+        // value. Scalar mapping keys are not values visited by `convert`.
+        let too_deep = match &event {
+            Event::SequenceStart(..) | Event::MappingStart(..) => {
+                receiver.stack.len() > limits.yaml_depth
+            }
+            Event::Scalar(..)
+                if !matches!(
+                    receiver.stack.last(),
+                    Some(Container::Mapping {
+                        expecting_key: true,
+                        ..
+                    })
+                ) =>
+            {
+                receiver.stack.len() > limits.yaml_depth
+            }
+            _ => false,
+        };
+        let stream_end = event == Event::StreamEnd;
+        receiver.on_event(event);
+        if too_deep {
+            // Keep the priority of safety errors already observed, but do not
+            // parse the remaining suffix merely to choose another diagnostic.
+            receiver.check()?;
+            return Err(WorkerError::new(
+                "yaml_too_deep",
+                "YAML nesting exceeds its limit",
+            ));
+        }
+        if stream_end {
+            break;
+        }
     }
-    if receiver.documents != 1 {
-        return Err(WorkerError::new(
-            "yaml_parse",
-            "exactly one YAML document is required",
-        ));
-    }
-    if receiver.duplicate {
-        return Err(WorkerError::new("yaml_parse", "duplicate mapping key"));
-    }
-    if receiver.complex_key {
-        return Err(WorkerError::new(
-            "yaml_parse",
-            "complex mapping keys are not supported",
-        ));
-    }
+    receiver.check()?;
     let documents = YamlLoader::load_from_str(text)
         .map_err(|error| WorkerError::new("yaml_parse", error.to_string()))?;
     let value = documents
@@ -203,6 +250,118 @@ fn convert(value: &Yaml, depth: usize, limits: Limits) -> Result<DataValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_boundary_counts_values_and_empty_containers_but_not_scalar_keys() {
+        for (open, close) in [("[", "]"), ("{key: ", "}")] {
+            for leaf in ["0", "null", "[]", "{}"] {
+                for depth in [63, 64, 65] {
+                    let source = format!(
+                        "x: {}{leaf}{}",
+                        open.repeat(depth - 1),
+                        close.repeat(depth - 1)
+                    );
+                    let result = parse_mapping(&source, Limits::default());
+                    if depth <= 64 {
+                        assert!(result.is_ok(), "depth {depth}: {source}");
+                    } else {
+                        assert_eq!(result.unwrap_err().code, "yaml_too_deep");
+                    }
+                }
+            }
+        }
+        let limits = Limits {
+            yaml_depth: 0,
+            ..Limits::default()
+        };
+        assert!(parse_mapping("{}", limits).is_ok());
+        assert_eq!(
+            parse_mapping("x: null", limits).unwrap_err().code,
+            "yaml_too_deep"
+        );
+    }
+
+    #[test]
+    fn rejects_deep_block_sequences_and_mappings_before_recursive_loading() {
+        let sequences = format!("x:\n  {}0\n", "- ".repeat(20_000));
+        let mappings = (0..1400)
+            .map(|depth| format!("{}x:\n", " ".repeat(depth)))
+            .collect::<String>();
+        for source in [sequences, mappings] {
+            assert!(source.len() < Limits::default().input_bytes);
+            assert_eq!(
+                parse_mapping(&source, Limits::default()).unwrap_err().code,
+                "yaml_too_deep"
+            );
+        }
+    }
+
+    #[test]
+    fn stops_at_depth_limit_instead_of_parsing_the_remaining_suffix() {
+        // The suffix is malformed, but inspecting it would require continuing
+        // beyond the value-depth budget. A quoted scalar stays one value.
+        for suffix in ["broken: [", "a: &a value\nb: *a", "a: 1\na: 2"] {
+            let source = format!("x:\n  {}0\n{suffix}", "- ".repeat(65));
+            assert_eq!(
+                parse_mapping(&source, Limits::default()).unwrap_err().code,
+                "yaml_too_deep"
+            );
+        }
+        let quoted = format!("x: '{}'", "[".repeat(20_000));
+        assert!(parse_mapping(&quoted, Limits::default()).is_ok());
+    }
+
+    #[test]
+    fn retains_observed_safety_error_priority_before_depth_rejection() {
+        let deep = format!("x:\n  {}0\n", "- ".repeat(65));
+        for (prefix, code, message) in [
+            ("a: &a value\nb: *a\n", "unsafe_yaml", "aliases and tags"),
+            ("a: !!str value\n", "unsafe_yaml", "aliases and tags"),
+            ("a: !custom []\n", "unsafe_yaml", "aliases and tags"),
+            ("<<: value\n", "unsafe_yaml", "aliases and tags"),
+            ("a: 1\na: 2\n", "yaml_parse", "duplicate mapping key"),
+            ("? [a, b]\n: value\n", "yaml_parse", "complex mapping keys"),
+            (
+                "---\na: 1\n---\n",
+                "yaml_parse",
+                "exactly one YAML document",
+            ),
+        ] {
+            let error = parse_mapping(&format!("{prefix}{deep}"), Limits::default()).unwrap_err();
+            assert_eq!(error.code, code, "{prefix}");
+            assert!(error.message.contains(message), "{error}");
+        }
+        let limits = Limits {
+            input_bytes: deep.len() - 1,
+            ..Limits::default()
+        };
+        assert_eq!(
+            parse_mapping(&deep, limits).unwrap_err().code,
+            "input_too_large"
+        );
+        // Safety metadata on the depth-breaching event is still observed.
+        let limits = Limits {
+            yaml_depth: 0,
+            ..Limits::default()
+        };
+        for source in ["x: !!str value", "x: &a []", "x: !custom {}"] {
+            assert_eq!(
+                parse_mapping(source, limits).unwrap_err().code,
+                "unsafe_yaml"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_block_and_flow_value_semantics() {
+        let block =
+            "---\nempty:\nitems:\n  - true\n  - 'null'\n  - 2\ntext: |\n  [brackets]\n...\n";
+        let flow = "{empty: null, items: [true, 'null', 2], text: \"[brackets]\\n\"}";
+        assert_eq!(
+            parse_mapping(block, Limits::default()).unwrap(),
+            parse_mapping(flow, Limits::default()).unwrap()
+        );
+    }
 
     #[test]
     fn accepts_core_mapping_and_rejects_unsafe_yaml() {
