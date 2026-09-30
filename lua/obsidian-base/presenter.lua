@@ -8,6 +8,8 @@ local namespace = vim.api.nvim_create_namespace("obsidian-base-preview")
 ---@type integer
 local source_namespace = vim.api.nvim_create_namespace("obsidian-base-sources")
 local state_for
+-- Cache ownership follows coordinator buffer state, including detach and wipeout.
+local fold_cache = setmetatable({}, { __mode = "k" })
 
 ---Measure text using Neovim's display-cell width rules.
 ---@param text string
@@ -64,6 +66,44 @@ end
 local function source_fold_range(source, start, finish)
   if source.end_is_eof then finish = finish - 1 end
   return start, finish
+end
+
+---Snapshot moving anchors until text changes, sources are replaced, or refresh_foldexpr runs.
+---@param bufnr integer
+---@param buffer ObsidianBasesBuffer
+---@return table[] Inclusive zero-based fold ranges in source order.
+local function fold_ranges(bufnr, buffer)
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
+  local cached = fold_cache[buffer]
+  -- Detach can replace sources before a later refresh, without changing the text.
+  if cached and cached.tick == tick and cached.sources == buffer.sources then return cached.ranges end
+  local ranges = {}
+  for _, source in ipairs(buffer.sources) do
+    local start, finish = source_range(bufnr, source)
+    if start and finish then
+      start, finish = source_fold_range(source, start, finish)
+      if finish > start then ranges[#ranges + 1] = { start, finish } end
+    end
+  end
+  fold_cache[buffer] = { tick = tick, sources = buffer.sources, ranges = ranges }
+  return ranges
+end
+
+---Find the first source covering a row without scanning sources per fold call.
+---@param ranges table[]
+---@param row integer Zero-based buffer row.
+---@return table?
+local function fold_range_at(ranges, row)
+  -- Discovery orders sources by row. Starts share left gravity and ends share
+  -- right gravity, so edits preserve endpoint order even when ranges overlap.
+  -- The first end at or after this row preserves the original first-match rule.
+  local low, high = 1, #ranges
+  while low <= high do
+    local middle = math.floor((low + high) / 2)
+    if ranges[middle][2] < row then low = middle + 1 else high = middle - 1 end
+  end
+  local range = ranges[low]
+  if range and range[1] <= row then return range end
 end
 
 ---Format a table result into width-aware highlighted virtual lines.
@@ -206,15 +246,12 @@ function M.foldexpr(lnum, fallback, base_level)
   local bufnr = vim.api.nvim_get_current_buf()
   local buffer = state_for and state_for(bufnr)
   if buffer and buffer.enabled then
-    for _, source in ipairs(buffer.sources) do
-      local start, finish = source_range(bufnr, source)
-      start, finish = source_fold_range(source, start, finish)
-      if start and finish and finish > start then
-        local level = base_level or fallback_level() + 1
-        if lnum == start + 1 then return ">" .. level end
-        if lnum == finish + 1 then return "<" .. level end
-        if lnum > start + 1 and lnum < finish + 1 then return level end
-      end
+    local range = fold_range_at(fold_ranges(bufnr, buffer), lnum - 1)
+    if range then
+      local level = base_level or fallback_level() + 1
+      if lnum == range[1] + 1 then return ">" .. level end
+      if lnum == range[2] + 1 then return "<" .. level end
+      return level
     end
   end
   return fallback_level()
@@ -223,6 +260,8 @@ end
 ---Refresh cached fold levels for windows explicitly using the Base fold expression.
 ---@param bufnr integer
 function M.refresh_foldexpr(bufnr)
+  local buffer = state_for and state_for(bufnr)
+  if buffer then fold_cache[buffer] = nil end
   for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
     if vim.wo[win].foldmethod == "expr" and vim.wo[win].foldexpr:find("obsidian-base", 1, true) then
       vim.api.nvim_win_call(win, function() vim.cmd("silent! normal! zx") end)

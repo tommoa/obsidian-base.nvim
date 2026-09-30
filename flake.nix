@@ -115,6 +115,7 @@
                 nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/config-smoke.lua"
                 nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/presenter-smoke.lua"
                 nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/picker-smoke.lua"
+                nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/foldexpr-smoke.lua"
                 nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/native-installer-smoke.lua"
                 OBSIDIAN_BASE_WORKER=${worker}/bin/obsidian-base-worker \
                     nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/worker-smoke.lua"
