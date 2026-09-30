@@ -127,8 +127,16 @@ impl Index {
         })
     }
 
+    /// Resolve relative paths or natural-order basename matches against current records.
+    /// The public records map can change, so this lookup does not cache basename winners.
     pub fn resolve_link(&self, link: &str, from: &str) -> Option<String> {
-        resolve_link(link, from, &self.records)
+        resolve_link(link, from, &self.records, |basename| {
+            self.records
+                .values()
+                .filter(|record| record.name == basename)
+                .min_by(|left, right| natural_cmp(&left.path, &right.path))
+                .map(|record| record.path.clone())
+        })
     }
 }
 
@@ -345,6 +353,19 @@ impl Builder<'_> {
     }
 
     fn build_backlinks(&mut self) {
+        // All disk and overlay records exist now. Keep one natural-order winner per
+        // basename so fallback hits and misses do not scan the vault for each link.
+        let mut basename_targets: HashMap<String, String> = HashMap::new();
+        for record in self.records.values() {
+            basename_targets
+                .entry(record.name.clone())
+                .and_modify(|target| {
+                    if natural_cmp(&record.path, target).is_lt() {
+                        target.clone_from(&record.path);
+                    }
+                })
+                .or_insert_with(|| record.path.clone());
+        }
         let links = self
             .records
             .values()
@@ -357,7 +378,9 @@ impl Builder<'_> {
             })
             .collect::<Vec<_>>();
         for (from, link) in links {
-            if let Some(target) = resolve_link(&link, &from, &self.records) {
+            if let Some(target) = resolve_link(&link, &from, &self.records, |basename| {
+                basename_targets.get(basename).cloned()
+            }) {
                 if let Some(record) = self.records.get_mut(&target) {
                     record.backlinks.push(from.clone());
                 }
@@ -407,7 +430,13 @@ fn load_property_types(root: &Path, limits: Limits) -> Result<HashMap<String, St
         .collect())
 }
 
-fn resolve_link(link: &str, from: &str, records: &BTreeMap<String, FileRecord>) -> Option<String> {
+/// Prefer source-relative paths before consulting the caller's basename lookup.
+fn resolve_link(
+    link: &str,
+    from: &str,
+    records: &BTreeMap<String, FileRecord>,
+    basename_target: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
     let clean = link.replace('\\', "/");
     let clean = clean.strip_suffix(".md").unwrap_or(&clean);
     let folder = from.rsplit_once('/').map_or("", |(folder, _)| folder);
@@ -417,13 +446,9 @@ fn resolve_link(link: &str, from: &str, records: &BTreeMap<String, FileRecord>) 
             return Some(candidate);
         }
     }
-    // Match Obsidian's basename fallback; natural ordering makes ambiguous links deterministic.
+    // Both lookup strategies select the natural-order winner for ambiguous basenames.
     let basename = clean.rsplit('/').next().unwrap_or(clean);
-    records
-        .values()
-        .filter(|record| record.name == basename)
-        .min_by(|left, right| natural_cmp(&left.path, &right.path))
-        .map(|record| record.path.clone())
+    basename_target(basename)
 }
 
 fn normalize_join(folder: &str, target: &str) -> String {

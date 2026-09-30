@@ -7,6 +7,8 @@ use std::{
 
 use obsidian_base_worker::{
     ExecutionEnvironment, WorkerService,
+    index::{Index, Overlay},
+    limits::Limits,
     protocol::{InitialiseParams, LimitsPatch, QueryParams, QuerySource},
 };
 use tempfile::TempDir;
@@ -59,4 +61,39 @@ fn indexes_and_queries_five_thousand_files_within_thirty_seconds() {
     assert_eq!(result.matched_count, 5_001);
     assert_eq!(result.view_count, 5_001);
     assert!(started.elapsed() < Duration::from_secs(30));
+}
+
+#[test]
+fn builds_backlinks_for_five_thousand_fallback_and_broken_links() {
+    let root = TempDir::new().unwrap();
+    let mut overlays = BTreeMap::new();
+    for index in 0..5_000 {
+        overlays.insert(
+            format!("note-{index:04}.md"),
+            Overlay {
+                contents: format!("[[Target]] [[Missing-{index}]]"),
+                created_at: 0,
+            },
+        );
+    }
+    overlays.insert(
+        "Targets/Target.md".to_owned(),
+        Overlay {
+            contents: String::new(),
+            created_at: 0,
+        },
+    );
+    let started = Instant::now();
+    let index = Index::build(
+        root.path().to_owned(),
+        &overlays,
+        &Default::default(),
+        Limits::default(),
+        Vec::new(),
+    )
+    .unwrap();
+    let elapsed = started.elapsed();
+    eprintln!("5,001 records, 10,000 fallback/broken links: {elapsed:?}");
+    assert_eq!(index.records["Targets/Target.md"].backlinks.len(), 5_000);
+    assert!(elapsed < Duration::from_secs(30));
 }
