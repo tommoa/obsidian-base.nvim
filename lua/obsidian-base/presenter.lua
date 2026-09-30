@@ -26,7 +26,9 @@ local function truncate(text, width)
   if display_width(text) <= width then return text end
   if width == 1 then return "…" end
   local out, index = "", 0
-  while index < vim.fn.strchars(text) do
+  -- The input is immutable; count it once instead of rescanning it per character.
+  local character_count = vim.fn.strchars(text)
+  while index < character_count do
     local character = vim.fn.strcharpart(text, index, 1)
     if display_width(out .. character .. "…") > width then break end
     out = out .. character

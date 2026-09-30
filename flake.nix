@@ -113,6 +113,7 @@
                 test -x ${worker}/bin/obsidian-base-worker
                 python "$TMPDIR/obsidian-base.nvim/scripts/metadata-check.py"
                 nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/config-smoke.lua"
+                nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/presenter-smoke.lua"
                 nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/picker-smoke.lua"
                 nvim --headless -u NONE -i NONE -l "$TMPDIR/obsidian-base.nvim/scripts/native-installer-smoke.lua"
                 OBSIDIAN_BASE_WORKER=${worker}/bin/obsidian-base-worker \
