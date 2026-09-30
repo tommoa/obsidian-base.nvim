@@ -627,6 +627,19 @@ impl Evaluator<'_> {
             }),
             Expression::Identifier(name) => Ok(self.identifier(name, context)),
             Expression::Member(object, property) => {
+                // Select the value before materializing the `property` namespace. Bare
+                // `property` remains an owned object, and `isEmpty` keeps method precedence.
+                if matches!(&**object, Expression::Identifier(name) if name == "property")
+                    && property != "isEmpty"
+                {
+                    budget.step()?; // Account for the unevaluated namespace identifier.
+                    return Ok(self
+                        .current(context)
+                        .properties
+                        .get(property)
+                        .map(EvalValue::from)
+                        .unwrap_or(EvalValue::Empty));
+                }
                 let value = self.evaluate(object, context, budget)?;
                 self.member(value, property, context, budget)
             }
@@ -1112,6 +1125,108 @@ fn cell(value: EvalValue) -> Cell {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn property_members_preserve_object_semantics_and_evaluation_budget() {
+        let limits = Limits::default();
+        let properties = BTreeMap::from([
+            ("rank".into(), DataValue::Number(2.0)),
+            ("name".into(), DataValue::String("frontmatter name".into())),
+            ("null".into(), DataValue::Null),
+            ("isEmpty".into(), DataValue::Bool(true)),
+            ("date".into(), DataValue::Date(0)),
+            (
+                "nested".into(),
+                DataValue::Object(BTreeMap::from([("rank".into(), DataValue::Number(3.0))])),
+            ),
+            (
+                "values".into(),
+                DataValue::List(vec![DataValue::Number(4.0)]),
+            ),
+        ]);
+        let mut index = Index::empty(PathBuf::from("/vault"));
+        index.records.insert(
+            "Host.md".into(),
+            FileRecord {
+                path: "Host.md".into(),
+                name: "Host".into(),
+                basename: "Host.md".into(),
+                folder: String::new(),
+                extension: "md".into(),
+                ctime: 0,
+                mtime: 0,
+                properties: properties.clone(),
+                tags: Vec::new(),
+                links: Vec::new(),
+                backlinks: Vec::new(),
+            },
+        );
+        let formulas =
+            BTreeMap::from([("all".into(), parse_expression("property", limits).unwrap())]);
+        let environment =
+            ExecutionEnvironment::new(jiff::Timestamp::UNIX_EPOCH, jiff::tz::TimeZone::UTC);
+        let evaluator = Evaluator {
+            index: &index,
+            limits,
+            formulas: &formulas,
+            environment: &environment,
+        };
+        let mut context = EvalContext::new("Host.md", "Host.md");
+        for (source, kind, text) in [
+            ("property.rank", "number", "2"),
+            ("(property).rank", "number", "2"),
+            ("file.rank", "number", "2"),
+            ("rank", "number", "2"),
+            ("property.name", "string", "frontmatter name"),
+            ("file.name", "string", "Host"),
+            ("property.missing", "empty", ""),
+            ("property.null", "empty", ""),
+            ("property.nested.rank", "number", "3"),
+            ("property.values[0]", "number", "4"),
+            ("property.values.map(value + 1)[0]", "number", "5"),
+            ("property.date.date()", "date", "1970-01-01"),
+            // Object methods take precedence even over a frontmatter key of this name.
+            ("property.isEmpty()", "boolean", "false"),
+            ("property", "object", "[object Object]"),
+            ("formula.all.rank", "number", "2"),
+            ("formula.all.isEmpty()", "boolean", "false"),
+        ] {
+            let value = evaluator
+                .evaluate(
+                    &parse_expression(source, limits).unwrap(),
+                    &mut context,
+                    &mut Budget::new(limits),
+                )
+                .unwrap();
+            let rendered = cell(value);
+            assert_eq!(
+                (rendered.kind.as_str(), rendered.text.as_str()),
+                (kind, text),
+                "{source}"
+            );
+        }
+        let EvalValue::Object(mut standalone) = evaluator.identifier("property", &context) else {
+            panic!("standalone property must remain an owned object");
+        };
+        assert_eq!(standalone, properties);
+        standalone.clear();
+        assert_eq!(evaluator.current(&context).properties, properties);
+
+        let expression = parse_expression("property.rank", limits).unwrap();
+        for steps in [1, 2] {
+            let mut budget = Budget::new(Limits {
+                evaluation_steps: steps,
+                ..limits
+            });
+            let result = evaluator.evaluate(&expression, &mut context, &mut budget);
+            assert_eq!(budget.steps, 2);
+            if steps == 1 {
+                assert_eq!(result.unwrap_err().code, "evaluation_limit");
+            } else {
+                assert!(matches!(result.unwrap(), EvalValue::Number(2.0)));
+            }
+        }
+    }
 
     #[test]
     fn numeric_comparisons_and_sort_use_numeric_order() {
