@@ -45,7 +45,6 @@ local augroup = vim.api.nvim_create_augroup("obsidian-base", { clear = true })
 ---@field root string
 ---@field buffers table<integer, boolean>
 ---@field pending table<integer, { method: string, callback: fun(error: ObsidianBasesProtocolError?, result: table?) }>
----@field results table<string, ObsidianBasesTableResult>
 ---@field next_id integer
 ---@field generation integer
 ---@field stderr_tail string
@@ -225,7 +224,6 @@ local function on_envelope(workspace, line)
     end
     if envelope.event then
         workspace.generation = envelope.event.generation
-        workspace.results = {}
         redraw_workspace(workspace)
         for bufnr in pairs(workspace.buffers) do
             local buffer = buffers[bufnr]
@@ -266,7 +264,6 @@ local function start_workspace(root)
         root = root,
         buffers = {},
         pending = {},
-        results = {},
         next_id = 1,
         generation = 0,
         stderr_tail = "",
@@ -525,7 +522,6 @@ local function query_sources(buffer, generation)
             target.error, target.result = query_error, result
             if result then
                 target.available_views = result.available_views
-                workspace.results[result.result_id] = result
             elseif query_error and query_error.available_views ~= nil then
                 target.available_views = query_error.available_views
             end

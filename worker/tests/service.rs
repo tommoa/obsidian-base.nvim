@@ -568,3 +568,160 @@ fn result_ids_follow_the_query_allocation_boundary() {
         "r1-2"
     );
 }
+
+#[test]
+fn same_generation_result_count_is_bounded_without_evicting_live_ids() {
+    let mut service = initialized();
+    let text = "filters: 'false'\nviews:\n  - type: table\n    name: Table\n    order: []\n";
+    let mut ids = Vec::new();
+    for index in 0..128 {
+        let mut params = inline_query(text, "Table");
+        params.source = QuerySource::Inline {
+            text: text.to_owned(),
+            source_id: Some(format!("source-{index}")),
+        };
+        ids.push(service.query(params, &environment()).unwrap().result_id);
+    }
+    for _ in 0..3 {
+        let error = service
+            .query(inline_query(text, "Table"), &environment())
+            .unwrap_err();
+        assert_eq!(error.code, "result_too_large");
+        assert_eq!(error.available_views.unwrap()[0].name, "Table");
+    }
+    for id in &ids {
+        for _ in 0..2 {
+            assert!(
+                service
+                    .fetch_rows(FetchRowsParams {
+                        result_id: id.clone()
+                    })
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+        }
+    }
+    service
+        .overlay_remove(OverlayPathParams {
+            path: "Draft.md".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(
+        service
+            .fetch_rows(FetchRowsParams {
+                result_id: ids[0].clone()
+            })
+            .unwrap_err()
+            .code,
+        "unknown_result"
+    );
+    assert_eq!(
+        service
+            .query(inline_query(text, "Table"), &environment())
+            .unwrap()
+            .result_id,
+        "r2-132"
+    );
+}
+
+#[test]
+fn same_generation_result_bytes_are_bounded_and_reinitialization_releases_them() {
+    let root = tempfile::TempDir::new().unwrap();
+    fs::write(
+        root.path().join("Host.md"),
+        format!("---\npayload: {}\n---\n", "x".repeat(512 * 1024)),
+    )
+    .unwrap();
+    let initialize = |service: &mut WorkerService| {
+        service
+            .initialize(InitialiseParams {
+                vault_root: root.path().to_string_lossy().into_owned(),
+                metadata_overrides: BTreeMap::new(),
+                limits: LimitsPatch::default(),
+            })
+            .unwrap();
+    };
+    let mut service = WorkerService::new();
+    initialize(&mut service);
+    let query = || {
+        let mut params = inline_query_at(
+            "views:\n  - type: table\n    name: Table\n    order: [payload]\n",
+            "Table",
+            "Host.md",
+        );
+        params.preview_rows = 0;
+        params
+    };
+    let mut ids = Vec::new();
+    let mut bytes = 0;
+    loop {
+        match service.query(query(), &environment()) {
+            Ok(result) => {
+                let rows = service
+                    .fetch_rows(FetchRowsParams {
+                        result_id: result.result_id.clone(),
+                    })
+                    .unwrap();
+                bytes += serde_json::to_vec(&rows).unwrap().len();
+                ids.push(result.result_id);
+                assert!(
+                    ids.len() < 128,
+                    "byte budget must fill before the entry budget"
+                );
+            }
+            Err(error) => {
+                assert_eq!(error.code, "result_too_large");
+                assert_eq!(error.available_views.unwrap()[0].name, "Table");
+                break;
+            }
+        }
+    }
+    assert!(bytes <= 16 * 1024 * 1024);
+    assert!(bytes + 512 * 1024 > 16 * 1024 * 1024);
+    // A failed publication must preserve both cached rows and their accounting.
+    fs::create_dir(root.path().join(".obsidian")).unwrap();
+    fs::write(root.path().join(".obsidian/types.json"), "{").unwrap();
+    assert!(
+        service
+            .reindex_external(vec![".obsidian/types.json".to_owned()])
+            .is_err()
+    );
+    assert_eq!(
+        service.query(query(), &environment()).unwrap_err().code,
+        "result_too_large"
+    );
+    for id in &ids {
+        let rows = service
+            .fetch_rows(FetchRowsParams {
+                result_id: id.clone(),
+            })
+            .unwrap();
+        assert_eq!(rows.rows[0].cells[0].text.len(), 512 * 1024);
+    }
+    fs::write(root.path().join(".obsidian/types.json"), "{}").unwrap();
+    service
+        .reindex_external(vec![".obsidian/types.json".to_owned()])
+        .unwrap();
+    assert_eq!(
+        service
+            .fetch_rows(FetchRowsParams {
+                result_id: ids[0].clone()
+            })
+            .unwrap_err()
+            .code,
+        "unknown_result"
+    );
+    let result = service.query(query(), &environment()).unwrap();
+    initialize(&mut service);
+    assert_eq!(
+        service
+            .fetch_rows(FetchRowsParams {
+                result_id: result.result_id
+            })
+            .unwrap_err()
+            .code,
+        "unknown_result"
+    );
+    assert!(service.query(query(), &environment()).is_ok());
+}

@@ -71,6 +71,14 @@ change hints, not the scan strategy or query dependencies.
 be a positive integer. Omitted limit fields use the worker defaults.
 `preview_rows` is an unsigned integer and defaults to 50.
 
+Successful queries retain complete rows until the next successful index
+publication or initialization. Repeated `fetch_rows` calls do not consume a
+result. The cache admits at most 128 results and 16 MiB in aggregate compact
+JSON `{result_id,rows}` payloads, independently of the per-result limits.
+Queries exceeding either cache bound fail with `result_too_large` without
+evicting existing IDs. Capacity becomes available after index publication or
+initialization; failed scans and failed queries preserve cached rows.
+
 ## Failures
 
 Malformed JSON, invalid request shapes, unknown fields, and out-of-range IDs are

@@ -18,6 +18,10 @@ use crate::{
     query::{QueryInput, ResultRow, execute},
 };
 
+// Both bounds matter: empty row sets still retain an ID and a map entry.
+const MAX_CACHED_RESULTS: usize = 128;
+const MAX_CACHED_RESULT_BYTES: usize = 16 * 1024 * 1024;
+
 /// One published index generation, retained internally until the actor emits it.
 pub struct IndexChange {
     pub generation: u64,
@@ -40,6 +44,8 @@ struct InitializedService {
     generation: u64,
     result_sequence: u64,
     results: HashMap<String, Vec<ResultRow>>,
+    /// Sum of complete serialized row payload sizes, not process memory usage.
+    result_bytes: usize,
     watcher_errors: Vec<String>,
     /// A rejected watcher batch may contain changes absent from later named hints.
     needs_rescan: bool,
@@ -60,6 +66,7 @@ impl InitializedService {
         self.index = index;
         self.generation += 1;
         self.results.clear();
+        self.result_bytes = 0;
         self.needs_rescan = false;
     }
 
@@ -179,6 +186,7 @@ impl WorkerService {
             generation: generation + 1,
             result_sequence: 0,
             results: HashMap::new(),
+            result_bytes: 0,
             watcher_errors,
             needs_rescan: false,
         });
@@ -237,6 +245,18 @@ impl WorkerService {
             }
         };
         state.result_sequence = sequence;
+        // IDs can outlive their source preview and remain in queued fetches.
+        // Reject admission rather than evicting any successful query's rows.
+        if state.results.len() >= MAX_CACHED_RESULTS
+            || output.rows_bytes > MAX_CACHED_RESULT_BYTES - state.result_bytes
+        {
+            return Err(WorkerError::new(
+                "result_too_large",
+                "query result cache is full; a new index generation or initialize releases cached rows",
+            )
+            .with_available_views(output.result.available_views));
+        }
+        state.result_bytes += output.rows_bytes;
         state
             .results
             .insert(output.result.result_id.clone(), output.rows);

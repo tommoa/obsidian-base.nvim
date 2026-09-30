@@ -66,6 +66,8 @@ pub struct QueryOutput {
     pub result: QueryResult,
     /// Complete rendered rows retained for subsequent fetch_rows requests.
     pub rows: Vec<ResultRow>,
+    /// Compact JSON bytes in the complete `{result_id,rows}` payload.
+    pub rows_bytes: usize,
 }
 
 pub fn execute(
@@ -243,7 +245,7 @@ pub fn execute(
         index_generation: generation,
     };
     assert_size(&result, limits).map_err(recover)?;
-    assert_size(
+    let rows_bytes = assert_size(
         &RowsForLimit {
             result_id: &result_id,
             rows: &rendered_rows,
@@ -254,6 +256,7 @@ pub fn execute(
     Ok(QueryOutput {
         result,
         rows: rendered_rows,
+        rows_bytes,
     })
 }
 
@@ -319,14 +322,15 @@ struct RowsForLimit<'a> {
     rows: &'a [ResultRow],
 }
 
-fn assert_size(value: &impl Serialize, limits: Limits) -> Result<()> {
-    if serde_json::to_vec(value)?.len() > limits.result_bytes {
+fn assert_size(value: &impl Serialize, limits: Limits) -> Result<usize> {
+    let bytes = serde_json::to_vec(value)?.len();
+    if bytes > limits.result_bytes {
         Err(WorkerError::new(
             "result_too_large",
             "query result exceeds the configured size limit",
         ))
     } else {
-        Ok(())
+        Ok(bytes)
     }
 }
 
