@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     time::Instant,
 };
 
@@ -119,6 +119,10 @@ pub fn execute(
         environment,
     };
     let mut matched = Vec::new();
+    // Compile only reached sources: eagerly parsing filters would reject invalid
+    // branches that every record skips through short-circuiting. Borrowed keys and
+    // ASTs live for this query only, so later queries still apply their own limits.
+    let mut filter_expressions = HashMap::new();
     for record in index.records.values() {
         let context = contexts
             .entry(record.path.clone())
@@ -126,7 +130,7 @@ pub fn execute(
         let mut include = true;
         for predicate in &predicates {
             if !evaluator
-                .matches(predicate, context, &mut budget)
+                .matches(predicate, &mut filter_expressions, context, &mut budget)
                 .map_err(recover)?
             {
                 include = false;
@@ -528,7 +532,7 @@ impl EvalContext {
 struct Evaluator<'a> {
     /// Immutable index that supplies records and link targets.
     index: &'a Index,
-    /// Limits used when parsing nested expressions in filters.
+    /// Limits used for filter parsing and formula dependency depth.
     limits: Limits,
     /// Compiled formulas referenced through the `formula` namespace.
     formulas: &'a BTreeMap<String, Expression>,
@@ -537,19 +541,25 @@ struct Evaluator<'a> {
 }
 
 impl Evaluator<'_> {
-    fn matches(
+    /// Match a filter, compiling each reached source once in the query's cache.
+    fn matches<'filter>(
         &self,
-        filter: &DataValue,
+        filter: &'filter DataValue,
+        expressions: &mut HashMap<&'filter str, Expression>,
         context: &mut EvalContext,
         budget: &mut Budget,
     ) -> Result<bool> {
         match filter {
-            DataValue::String(source) => Ok(self
-                .evaluate(&parse_expression(source, self.limits)?, context, budget)?
-                .truthy()),
+            DataValue::String(source) => {
+                let expression = match expressions.entry(source.as_str()) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(parse_expression(source, self.limits)?),
+                };
+                Ok(self.evaluate(expression, context, budget)?.truthy())
+            }
             DataValue::List(values) => {
                 for value in values {
-                    if !self.matches(value, context, budget)? {
+                    if !self.matches(value, expressions, context, budget)? {
                         return Ok(false);
                     }
                 }
@@ -573,13 +583,13 @@ impl Evaluator<'_> {
                     return match values {
                         DataValue::List(values) => {
                             for value in values {
-                                if self.matches(value, context, budget)? {
+                                if self.matches(value, expressions, context, budget)? {
                                     return Ok(false);
                                 }
                             }
                             Ok(true)
                         }
-                        value => Ok(!self.matches(value, context, budget)?),
+                        value => Ok(!self.matches(value, expressions, context, budget)?),
                     };
                 }
                 let DataValue::List(values) = values else {
@@ -590,14 +600,14 @@ impl Evaluator<'_> {
                 };
                 if operator == "and" {
                     for value in values {
-                        if !self.matches(value, context, budget)? {
+                        if !self.matches(value, expressions, context, budget)? {
                             return Ok(false);
                         }
                     }
                     Ok(true)
                 } else {
                     for value in values {
-                        if self.matches(value, context, budget)? {
+                        if self.matches(value, expressions, context, budget)? {
                             return Ok(true);
                         }
                     }
@@ -1125,6 +1135,148 @@ fn cell(value: EvalValue) -> Cell {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn filter_parsing_scales_with_reached_sources_in_each_query() {
+        let environment = ExecutionEnvironment::capture();
+        for record_count in [1, 100, 1000] {
+            let mut index = Index::empty(PathBuf::from("/vault"));
+            for ordinal in 0..record_count {
+                let path = format!("{ordinal}.md");
+                index.records.insert(
+                    path.clone(),
+                    FileRecord {
+                        path: path.clone(),
+                        name: ordinal.to_string(),
+                        basename: path,
+                        folder: String::new(),
+                        extension: "md".into(),
+                        ctime: 0,
+                        mtime: 0,
+                        properties: BTreeMap::new(),
+                        tags: Vec::new(),
+                        links: Vec::new(),
+                        backlinks: Vec::new(),
+                    },
+                );
+            }
+            // Repeated sources span the base and view filters. The invalid branch
+            // is unreachable, and no formulas or columns contribute parse calls.
+            let source = "filters: ['true', '1 == 1', 'true']\nviews:\n  - type: table\n    filters:\n      or: ['true', '(']\n    order: []\n";
+            for _ in 0..2 {
+                let before = crate::expression::PARSE_INVOCATIONS.with(|count| count.get());
+                let output = execute(
+                    &index,
+                    Limits::default(),
+                    1,
+                    1,
+                    &mut false,
+                    &environment,
+                    QueryInput {
+                        text: source.into(),
+                        source_id: "test".into(),
+                        host_path: "0.md".into(),
+                        view_name: None,
+                        preview_rows: 0,
+                    },
+                )
+                .unwrap();
+                assert_eq!(output.result.matched_count, record_count);
+                let parsed =
+                    crate::expression::PARSE_INVOCATIONS.with(|count| count.get()) - before;
+                assert_eq!(parsed, 2, "record count: {record_count}");
+            }
+        }
+    }
+
+    #[test]
+    fn cached_filters_preserve_parse_and_evaluation_limits() {
+        let index = Index::empty(PathBuf::from("/vault"));
+        let formulas = BTreeMap::new();
+        let environment = ExecutionEnvironment::capture();
+        for (limits, source, code) in [
+            (
+                Limits {
+                    expression_bytes: 3,
+                    ..Limits::default()
+                },
+                "true",
+                "expression_too_large",
+            ),
+            (
+                Limits {
+                    ast_nodes: 1,
+                    ..Limits::default()
+                },
+                "1 == 1",
+                "ast_too_large",
+            ),
+            (
+                Limits {
+                    ast_depth: 1,
+                    ..Limits::default()
+                },
+                "!true",
+                "ast_too_deep",
+            ),
+        ] {
+            let evaluator = Evaluator {
+                index: &index,
+                limits,
+                formulas: &formulas,
+                environment: &environment,
+            };
+            let filter = DataValue::List(vec![
+                DataValue::String("0".into()),
+                DataValue::String(source.into()),
+            ]);
+            let mut expressions = HashMap::new();
+            let mut context = EvalContext::new("Host.md", "Host.md");
+            let mut budget = Budget::new(limits);
+            assert!(
+                !evaluator
+                    .matches(&filter, &mut expressions, &mut context, &mut budget)
+                    .unwrap()
+            );
+            let DataValue::List(values) = &filter else {
+                unreachable!()
+            };
+            assert_eq!(
+                evaluator
+                    .matches(&values[1], &mut expressions, &mut context, &mut budget)
+                    .unwrap_err()
+                    .code,
+                code
+            );
+        }
+
+        let limits = Limits {
+            evaluation_steps: 1,
+            ..Limits::default()
+        };
+        let evaluator = Evaluator {
+            index: &index,
+            limits,
+            formulas: &formulas,
+            environment: &environment,
+        };
+        let filter = DataValue::String("true".into());
+        let mut expressions = HashMap::new();
+        let mut context = EvalContext::new("Host.md", "Host.md");
+        let mut budget = Budget::new(limits);
+        assert!(
+            evaluator
+                .matches(&filter, &mut expressions, &mut context, &mut budget)
+                .unwrap()
+        );
+        assert_eq!(
+            evaluator
+                .matches(&filter, &mut expressions, &mut context, &mut budget)
+                .unwrap_err()
+                .code,
+            "evaluation_limit"
+        );
+    }
 
     #[test]
     fn property_members_preserve_object_semantics_and_evaluation_budget() {

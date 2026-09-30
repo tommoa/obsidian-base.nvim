@@ -12,6 +12,12 @@ use crate::{
     limits::Limits,
 };
 
+#[cfg(test)]
+thread_local! {
+    // Thread-local counts keep query scaling tests independent of parallel tests.
+    pub(crate) static PARSE_INVOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Debug, PartialEq)]
 /// A scalar literal accepted in a Bases expression.
 pub enum Literal {
@@ -78,6 +84,8 @@ impl Token {
 /// also requires the complete source to be consumed, so valid prefixes cannot
 /// hide unsupported trailing syntax.
 pub fn parse_expression(source: &str, limits: Limits) -> Result<Expression> {
+    #[cfg(test)]
+    PARSE_INVOCATIONS.with(|count| count.set(count.get() + 1));
     if source.len() > limits.expression_bytes {
         return Err(WorkerError::new(
             "expression_too_large",

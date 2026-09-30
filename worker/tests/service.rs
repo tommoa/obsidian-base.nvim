@@ -40,6 +40,21 @@ fn initialized() -> WorkerService {
     service
 }
 
+fn two_note_service(limits: LimitsPatch) -> (tempfile::TempDir, WorkerService) {
+    let vault = tempfile::tempdir().unwrap();
+    fs::write(vault.path().join("a.md"), "# A\n").unwrap();
+    fs::write(vault.path().join("b.md"), "# B\n").unwrap();
+    let mut service = WorkerService::new();
+    service
+        .initialize(InitialiseParams {
+            vault_root: vault.path().to_string_lossy().into_owned(),
+            metadata_overrides: BTreeMap::new(),
+            limits,
+        })
+        .unwrap();
+    (vault, service)
+}
+
 fn inline_base(ordinal: usize) -> String {
     fs::read_to_string(fixtures().join("vault/Calendar/Daily/2026-07-15.md"))
         .unwrap()
@@ -383,6 +398,100 @@ fn overlay_only_host_and_formula_cache_work() {
             .code,
         "missing_host"
     );
+}
+
+#[test]
+fn filter_groups_preserve_short_circuiting_and_truth_values() {
+    let (_vault, mut service) = two_note_service(LimitsPatch::default());
+    let cases = [
+        ("filters:\n  - 'false'\n  - 'file.name =='\n", 0),
+        (
+            "filters:\n  and:\n    - 'false'\n    - unsupported: ['true']\n",
+            0,
+        ),
+        ("filters:\n  or:\n    - 'true'\n    - 'file.name =='\n", 2),
+        (
+            "filters:\n  not:\n    - 'true'\n    - unsupported: ['true']\n",
+            0,
+        ),
+        (
+            "filters:\n  and:\n    - 'true'\n    - 'file.name == \"a\"'\n",
+            1,
+        ),
+        ("filters:\n  not: 'file.name == \"a\"'\n", 1),
+        ("filters:\n  and: []\n", 2),
+        ("filters:\n  or: []\n", 0),
+        ("filters:\n  not: []\n", 2),
+    ];
+    for (filters, expected_count) in cases {
+        let source = format!("{filters}views:\n  - type: table\n    name: Table\n    order: []\n");
+        let result = service
+            .query(inline_query_at(&source, "Table", "a.md"), &environment())
+            .unwrap();
+        assert_eq!(result.matched_count, expected_count, "{source}");
+    }
+}
+
+#[test]
+fn base_filter_short_circuits_selected_view_filters() {
+    let (_vault, mut service) = two_note_service(LimitsPatch::default());
+    let source = "filters: 'false'\nviews:\n  - type: table\n    name: Table\n    filters:\n      - 'file.name =='\n      - unsupported: ['true']\n    order: []\n";
+    let result = service
+        .query(inline_query_at(source, "Table", "a.md"), &environment())
+        .unwrap();
+    assert_eq!(result.matched_count, 0);
+}
+
+#[test]
+fn filters_in_unselected_views_are_not_parsed() {
+    let (_vault, mut service) = two_note_service(LimitsPatch::default());
+    let source = "views:\n  - type: table\n    name: Selected\n    filters: 'true'\n    order: []\n  - type: table\n    name: Unselected\n    filters: 'file.name =='\n    order: []\n";
+    let result = service
+        .query(inline_query_at(source, "Selected", "a.md"), &environment())
+        .unwrap();
+    assert_eq!(paths(&result), ["a.md", "b.md"]);
+}
+
+#[test]
+fn filter_error_reached_on_later_record_keeps_available_views() {
+    let (_vault, mut service) = two_note_service(LimitsPatch::default());
+    let source = "filters:\n  or:\n    - 'file.name == \"a\"'\n    - 'file.name =='\nviews:\n  - type: table\n    name: Table\n    order: []\n  - type: table\n    name: Other\n    order: []\n";
+    let error = service
+        .query(inline_query_at(source, "Table", "a.md"), &environment())
+        .unwrap_err();
+    assert_eq!(error.code, "expression_parse");
+    assert_eq!(
+        error
+            .available_views
+            .unwrap()
+            .iter()
+            .map(|view| view.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Table", "Other"]
+    );
+}
+
+#[test]
+fn expression_size_limit_applies_only_to_reached_filter_branches() {
+    let (_vault, mut service) = two_note_service(LimitsPatch {
+        expression_bytes: Some(NonZeroUsize::new(16).unwrap()),
+        ..LimitsPatch::default()
+    });
+    let unreachable = "filters:\n  or:\n    - 'true'\n    - 'file.name == \"b\" or false'\nviews:\n  - type: table\n    name: Table\n    order: []\n";
+    let result = service
+        .query(
+            inline_query_at(unreachable, "Table", "a.md"),
+            &environment(),
+        )
+        .unwrap();
+    assert_eq!(result.matched_count, 2);
+
+    let reached = "filters:\n  or:\n    - 'file.name == \"a\"'\n    - 'file.name == \"b\" or false'\nviews:\n  - type: table\n    name: Table\n    order: []\n";
+    let error = service
+        .query(inline_query_at(reached, "Table", "a.md"), &environment())
+        .unwrap_err();
+    assert_eq!(error.code, "expression_too_large");
+    assert_eq!(error.available_views.unwrap()[0].name, "Table");
 }
 
 #[test]
