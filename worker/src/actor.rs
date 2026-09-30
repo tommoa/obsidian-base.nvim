@@ -39,8 +39,9 @@ pub struct WorkerActor {
     service: WorkerService,
     /// Sender cloned into the vault watcher so changes re-enter this actor's queue.
     input: mpsc::Sender<ActorMessage>,
-    /// Typed response and event sink; the process boundary performs JSON serialization.
-    output: mpsc::UnboundedSender<WorkerEnvelope>,
+    /// Bounded response and event sink; awaiting delivery backpressures service work.
+    /// The process boundary performs JSON serialization.
+    output: mpsc::Sender<WorkerEnvelope>,
     /// Active watcher handle, retained to keep observation of the current vault alive.
     watcher: Option<VaultWatcher>,
     /// At most eight changed paths, or an empty-string sentinel requiring a full rescan.
@@ -51,10 +52,7 @@ pub struct WorkerActor {
 
 impl WorkerActor {
     /// Create an actor that emits typed worker envelopes on `output`.
-    pub fn new(
-        input: mpsc::Sender<ActorMessage>,
-        output: mpsc::UnboundedSender<WorkerEnvelope>,
-    ) -> Self {
+    pub fn new(input: mpsc::Sender<ActorMessage>, output: mpsc::Sender<WorkerEnvelope>) -> Self {
         Self {
             service: WorkerService::new(),
             input,
@@ -86,7 +84,8 @@ impl WorkerActor {
                     }
                 }
                 Some(ActorMessage::InvalidLine(message)) => {
-                    self.send_error(RequestId::INVALID, "invalid_request", message);
+                    self.send_error(RequestId::INVALID, "invalid_request", message)
+                        .await;
                 }
                 Some(ActorMessage::Watch(WatchMessage::Changed(paths))) => {
                     self.remember_watch_paths(paths);
@@ -122,7 +121,8 @@ impl WorkerActor {
         let envelope = match protocol::decode(line) {
             Ok(envelope) => envelope,
             Err(message) => {
-                self.send_error(RequestId::INVALID, "invalid_request", message);
+                self.send_error(RequestId::INVALID, "invalid_request", message)
+                    .await;
                 return true;
             }
         };
@@ -148,30 +148,35 @@ impl WorkerActor {
                 }
                 if let Some(change) = handled.index_change {
                     if overlay_change {
-                        self.emit_index_changed(change, IndexChangeOrigin::Overlay);
+                        self.emit_index_changed(change, IndexChangeOrigin::Overlay)
+                            .await;
                     }
                 }
-                let _ = self.output.send(WorkerEnvelope::Response(Box::new(
-                    ResponseEnvelope::success(id, handled.success),
-                )));
+                let _ = self
+                    .output
+                    .send(WorkerEnvelope::Response(Box::new(
+                        ResponseEnvelope::success(id, handled.success),
+                    )))
+                    .await;
             }
             Err(error) => {
-                let _ =
-                    self.output
-                        .send(WorkerEnvelope::Response(Box::new(ResponseEnvelope::error(
-                            id,
-                            ErrorPayload {
-                                code: error.code.to_owned(),
-                                message: error.message,
-                                available_views: error.available_views,
-                            },
-                        ))));
+                let _ = self
+                    .output
+                    .send(WorkerEnvelope::Response(Box::new(ResponseEnvelope::error(
+                        id,
+                        ErrorPayload {
+                            code: error.code.to_owned(),
+                            message: error.message,
+                            available_views: error.available_views,
+                        },
+                    ))))
+                    .await;
             }
         }
         !shutdown
     }
 
-    fn send_error(&self, id: RequestId, code: impl Into<String>, message: impl Into<String>) {
+    async fn send_error(&self, id: RequestId, code: impl Into<String>, message: impl Into<String>) {
         let _ = self
             .output
             .send(WorkerEnvelope::Response(Box::new(ResponseEnvelope::error(
@@ -181,17 +186,21 @@ impl WorkerActor {
                     message: message.into(),
                     available_views: None,
                 },
-            ))));
+            ))))
+            .await;
     }
 
-    fn emit_index_changed(&self, change: IndexChange, origin: IndexChangeOrigin) {
-        let _ = self.output.send(WorkerEnvelope::Event(EventEnvelope {
-            event: Event::IndexChanged {
-                generation: change.generation,
-                paths: change.paths,
-                origin,
-            },
-        }));
+    async fn emit_index_changed(&self, change: IndexChange, origin: IndexChangeOrigin) {
+        let _ = self
+            .output
+            .send(WorkerEnvelope::Event(EventEnvelope {
+                event: Event::IndexChanged {
+                    generation: change.generation,
+                    paths: change.paths,
+                    origin,
+                },
+            }))
+            .await;
     }
 
     fn start_watcher(&mut self) {
@@ -213,7 +222,10 @@ impl WorkerActor {
             .blocking_service(move |service| service.reindex_external(paths))
             .await
         {
-            Ok(change) => self.emit_index_changed(change, IndexChangeOrigin::Watch),
+            Ok(change) => {
+                self.emit_index_changed(change, IndexChangeOrigin::Watch)
+                    .await;
+            }
             Err(error) => self
                 .service
                 .record_watcher_error(format!("watcher rescan failed: {}", error.message)),
@@ -239,10 +251,13 @@ impl WorkerActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+    use tokio::time::timeout;
 
     fn actor() -> WorkerActor {
         let (input, _) = mpsc::channel(1);
-        let (output, _) = mpsc::unbounded_channel();
+        let (output, _) = mpsc::channel(1);
         WorkerActor::new(input, output)
     }
 
@@ -270,5 +285,140 @@ mod tests {
         actor.remember_watch_paths((0..8).map(|i| format!("{i}.md")).collect());
         actor.remember_watch_paths(vec!["0.md".into(), String::new(), "later.md".into()]);
         assert_eq!(actor.pending_paths, BTreeSet::from([String::new()]));
+    }
+
+    fn line(id: u64, method: &str, params: Value) -> ActorMessage {
+        ActorMessage::Line(
+            json!({"id": id, "request": {"method": method, "params": params}}).to_string(),
+        )
+    }
+
+    // Initialize the service directly so these tests do not depend on watcher timing.
+    fn initialized_actor(root: &TempDir) -> (WorkerActor, mpsc::Receiver<WorkerEnvelope>) {
+        let (input, _) = mpsc::channel(16);
+        let (output, receiver) = mpsc::channel(1);
+        let mut actor = WorkerActor::new(input, output);
+        let request = protocol::decode(
+            &json!({"id": 1, "request": {"method": "initialize", "params": {"vault_root": root.path()}}}).to_string(),
+        ).unwrap();
+        actor
+            .service
+            .handle(request.request, &ExecutionEnvironment::capture())
+            .unwrap();
+        (actor, receiver)
+    }
+
+    #[tokio::test]
+    async fn stalled_output_backpressures_fetches_and_drains_in_order_before_shutdown() {
+        let root = TempDir::new().unwrap();
+        let payload = "x".repeat(66 * 1024);
+        std::fs::write(
+            root.path().join("Host.md"),
+            format!("---\npayload: {payload}\n---\n"),
+        )
+        .unwrap();
+        let (mut actor, mut output) = initialized_actor(&root);
+        let request = protocol::decode(&json!({"id": 2, "request": {"method": "query", "params": {
+            "source": {"kind": "inline", "text": "views:\n  - type: table\n    name: Table\n    order: [payload]\n"},
+            "host_path": "Host.md", "preview_rows": 0
+        }}}).to_string()).unwrap();
+        let handled = actor
+            .service
+            .handle(request.request, &ExecutionEnvironment::capture())
+            .unwrap();
+        let crate::protocol::Success::Query(query) = handled.success else {
+            panic!("expected query");
+        };
+        let (input, receiver) = mpsc::channel(16);
+        for id in 3..7 {
+            input
+                .send(line(
+                    id,
+                    "fetch_rows",
+                    json!({"result_id": query.result_id}),
+                ))
+                .await
+                .unwrap();
+        }
+        input
+            .send(ActorMessage::InvalidLine("request line is not UTF-8"))
+            .await
+            .unwrap();
+        input
+            .send(ActorMessage::Line("not json".to_owned()))
+            .await
+            .unwrap();
+        input
+            .send(line(7, "fetch_rows", json!({"result_id": "missing"})))
+            .await
+            .unwrap();
+        input
+            .send(line(
+                8,
+                "overlay_upsert",
+                json!({"path": "Draft.md", "contents": "# Draft\n"}),
+            ))
+            .await
+            .unwrap();
+        input.send(line(9, "shutdown", json!({}))).await.unwrap();
+        let mut task = tokio::spawn(actor.run(receiver));
+        // With no consumer, the actor must stop at delivery rather than finish the pipeline.
+        assert!(
+            timeout(Duration::from_millis(100), &mut task)
+                .await
+                .is_err()
+        );
+        let mut envelopes = Vec::new();
+        while let Some(envelope) = timeout(Duration::from_secs(5), output.recv())
+            .await
+            .unwrap()
+        {
+            envelopes.push(serde_json::to_value(envelope).unwrap());
+        }
+        task.await.unwrap();
+        assert_eq!(envelopes.len(), 10);
+        for (index, id) in (3..7).enumerate() {
+            assert_eq!(envelopes[index]["id"], id);
+            assert_eq!(
+                envelopes[index]["response"]["result"]["data"]["rows"][0]["cells"][0]["text"],
+                payload
+            );
+        }
+        for envelope in &envelopes[4..6] {
+            assert_eq!(envelope["id"], 0);
+            assert_eq!(envelope["response"]["error"]["code"], "invalid_request");
+        }
+        assert_eq!(envelopes[6]["id"], 7);
+        assert_eq!(envelopes[6]["response"]["error"]["code"], "unknown_result");
+        assert_eq!(envelopes[7]["event"]["origin"], "overlay");
+        assert_eq!(envelopes[8]["id"], 8);
+        assert_eq!(envelopes[9]["id"], 9);
+        assert_eq!(envelopes[9]["response"]["result"]["method"], "shutdown");
+    }
+
+    #[tokio::test]
+    async fn watcher_event_waits_for_output_capacity() {
+        let root = TempDir::new().unwrap();
+        let (mut actor, mut output) = initialized_actor(&root);
+        actor
+            .send_error(RequestId::INVALID, "invalid_request", "seed")
+            .await;
+        actor.pending_paths.insert("Observed.md".to_owned());
+        let flush = actor.flush_watch();
+        tokio::pin!(flush);
+        assert!(
+            timeout(Duration::from_millis(100), &mut flush)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            WorkerEnvelope::Response(_)
+        ));
+        timeout(Duration::from_secs(5), &mut flush).await.unwrap();
+        let event = serde_json::to_value(output.recv().await.unwrap()).unwrap();
+        assert_eq!(event["event"]["origin"], "watch");
+        assert_eq!(event["event"]["generation"], 2);
+        assert_eq!(event["event"]["paths"], json!(["Observed.md"]));
     }
 }

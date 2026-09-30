@@ -68,7 +68,8 @@ async fn read_input_line<R: tokio::io::AsyncBufRead + Unpin>(
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let (actor_tx, actor_rx) = mpsc::channel(64);
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<WorkerEnvelope>();
+    // A stalled stdout must backpressure the actor rather than retain arbitrary row copies.
+    let (output_tx, mut output_rx) = mpsc::channel::<WorkerEnvelope>(1);
     let reader_tx = actor_tx.clone();
     let reader = tokio::spawn(async move {
         let mut input = BufReader::new(tokio::io::stdin());

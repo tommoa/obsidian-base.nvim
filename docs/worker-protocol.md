@@ -49,6 +49,9 @@ a complete named change set. The index may also perform a full scan for
 named hints, such as a property-type change or symlink path. Every
 publication still invalidates all cached result IDs; these paths describe
 change hints, not the scan strategy or query dependencies.
+Responses and events share a bounded output queue. When stdout stops draining,
+request processing and watcher updates wait for output capacity; clients must
+continue reading stdout while sending requests and waiting for shutdown.
 
 ## Methods
 

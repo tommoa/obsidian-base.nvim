@@ -206,3 +206,54 @@ fn run(requests: &[Value]) -> Vec<Value> {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
 }
+
+#[tokio::test]
+async fn paused_stdout_backpressures_input_and_resumes_through_shutdown() {
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt},
+        time::{Duration, timeout},
+    };
+
+    // Kill the test process on failure so a stalled pipe cannot strand a worker.
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_obsidian-base-worker"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        let root = TempDir::new().unwrap();
+        let payload = "x".repeat(66 * 1024);
+        std::fs::write(root.path().join("Host.md"), format!("---\npayload: {payload}\n---\n")).unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        stdin.write_all(format!("{}\n", request(1, "initialize", json!({"vault_root": root.path()}))).as_bytes()).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&stdout.next_line().await.unwrap().unwrap()).unwrap()["id"], 1);
+        stdin.write_all(format!("{}\n", request(2, "query", json!({
+            "source": {"kind": "inline", "text": "views:\n  - type: table\n    name: Table\n    order: [payload]\n"},
+            "host_path": "Host.md", "preview_rows": 0
+        }))).as_bytes()).await.unwrap();
+        let query: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+        let result_id = query["response"]["result"]["data"]["result_id"].clone();
+        let mut feed = tokio::spawn(async move {
+            for id in 3..259 {
+                // Valid trailing whitespace makes the pipeline exceed stdin pipe capacity.
+                let line = format!("{}{}\n", request(id, "fetch_rows", json!({"result_id": result_id})), " ".repeat(4096));
+                stdin.write_all(line.as_bytes()).await.unwrap();
+            }
+            stdin.write_all(format!("{}\n", request(259, "shutdown", json!({}))).as_bytes()).await.unwrap();
+        });
+        assert!(timeout(Duration::from_millis(200), &mut feed).await.is_err());
+        for id in 3..259 {
+            let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(response["id"], id);
+            assert_eq!(response["response"]["result"]["data"]["rows"][0]["cells"][0]["text"], payload);
+        }
+        let shutdown: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(shutdown["id"], 259);
+        assert_eq!(shutdown["response"]["result"]["method"], "shutdown");
+        assert!(stdout.next_line().await.unwrap().is_none());
+        feed.await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+    }).await.expect("worker did not resume after stdout was drained");
+}
