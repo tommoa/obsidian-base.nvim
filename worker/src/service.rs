@@ -176,7 +176,7 @@ impl WorkerService {
             limits,
             watcher_errors.clone(),
         )?;
-        let files = index.records.len();
+        let files = index.records().len();
         self.state = Some(InitializedService {
             root,
             index,
@@ -363,7 +363,7 @@ impl WorkerService {
             },
             Some(state) => InspectResult {
                 generation: state.generation,
-                files: state.index.records.len(),
+                files: state.index.records().len(),
                 overlays: state.overlays.keys().cloned().collect(),
                 skipped_non_utf8: state.index.diagnostics.skipped_non_utf8,
                 skipped_non_utf8_examples: state

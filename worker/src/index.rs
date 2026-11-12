@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -77,8 +78,10 @@ pub struct Diagnostics {
 pub struct Index {
     /// Canonical vault root used to build this snapshot.
     pub root: PathBuf,
-    /// File records keyed by vault-relative path.
-    pub records: BTreeMap<String, FileRecord>,
+    /// Records and their derived lookup are published together. Mutations stay
+    /// inside the index so cached resolution cannot outlive its target set.
+    records: BTreeMap<String, Arc<FileRecord>>,
+    basename_targets: Arc<OnceLock<HashMap<String, String>>>,
     /// Non-fatal observations made while scanning the vault.
     pub diagnostics: Diagnostics,
     /// Property coercions used by these records; a changed schema requires a full scan.
@@ -90,9 +93,22 @@ impl Index {
         Self {
             root,
             records: BTreeMap::new(),
+            basename_targets: Arc::default(),
             diagnostics: Diagnostics::default(),
             property_types: HashMap::new(),
         }
+    }
+
+    /// Read the records in this immutable snapshot, keyed by vault-relative path.
+    pub fn records(&self) -> &BTreeMap<String, Arc<FileRecord>> {
+        &self.records
+    }
+
+    /// Query unit tests construct synthetic records without filesystem scanning.
+    #[cfg(test)]
+    pub(crate) fn insert_test_record(&mut self, key: String, record: Arc<FileRecord>) {
+        self.records.insert(key, record);
+        self.basename_targets = Arc::default();
     }
 
     pub fn build(
@@ -122,10 +138,12 @@ impl Index {
                 builder.index(path)?;
             }
         }
+        let basename_targets = Arc::default();
         builder.build_backlinks();
         Ok(Self {
             root,
             records: builder.records,
+            basename_targets,
             diagnostics: builder.diagnostics,
             property_types: builder.property_types,
         })
@@ -134,8 +152,9 @@ impl Index {
     /// Build a transactional candidate by rereading only named ordinary files.
     ///
     /// Directory, symlink, excluded, and unnamed hints fall back to a full scan.
-    /// Backlinks are rebuilt over the complete candidate because adding or removing
-    /// a target can change resolution of links in otherwise unchanged notes.
+    /// With unchanged paths, only edited sources can change outgoing edges.
+    /// Adding or removing a target rebuilds resolution over the full candidate,
+    /// since links in otherwise unchanged notes can acquire a different target.
     /// Named hints must cover every changed overlay and file; metadata overrides
     /// and limits must match the original build. Use an empty hint list to rescan
     /// when those inputs change or the complete change set is unknown.
@@ -182,10 +201,21 @@ impl Index {
                 result => result?,
             }
         }
-        builder.build_backlinks();
+        let basename_targets = if paths
+            .iter()
+            .any(|path| self.records.contains_key(path) != builder.records.contains_key(path))
+        {
+            let targets = Arc::default();
+            builder.refresh_backlinks();
+            targets
+        } else {
+            builder.refresh_source_links(self, paths);
+            Arc::clone(&self.basename_targets)
+        };
         Ok(Self {
             root: self.root.clone(),
             records: builder.records,
+            basename_targets,
             diagnostics: builder.diagnostics,
             property_types: builder.property_types,
         })
@@ -229,14 +259,17 @@ impl Index {
     }
 
     /// Resolve relative paths or natural-order basename matches against current records.
-    /// The public records map can change, so this lookup does not cache basename winners.
     pub fn resolve_link(&self, link: &str, from: &str) -> Option<String> {
         resolve_link(link, from, &self.records, |basename| {
-            self.records
-                .values()
-                .filter(|record| record.name == basename)
-                .min_by(|left, right| natural_cmp(&left.path, &right.path))
-                .map(|record| record.path.clone())
+            self.basename_targets
+                .get_or_init(|| {
+                    basename_targets(&self.records)
+                        .into_iter()
+                        .map(|(name, path)| (name.to_owned(), path.to_owned()))
+                        .collect()
+                })
+                .get(basename)
+                .cloned()
         })
     }
 }
@@ -287,7 +320,7 @@ struct Builder<'a> {
     /// Resource limits applied to parsed file contents.
     limits: Limits,
     /// Records collected during the current traversal.
-    records: BTreeMap<String, FileRecord>,
+    records: BTreeMap<String, Arc<FileRecord>>,
     /// Diagnostics accumulated without failing the complete scan.
     diagnostics: Diagnostics,
 }
@@ -448,49 +481,142 @@ impl Builder<'_> {
                 tags: tags.into_iter().collect(),
                 links: markdown.links,
                 backlinks: Vec::new(),
-            },
+            }
+            .into(),
         );
         Ok(())
     }
 
-    fn build_backlinks(&mut self) {
-        for record in self.records.values_mut() {
-            record.backlinks.clear();
-        }
-        // All disk and overlay records exist now. Keep one natural-order winner per
-        // basename so fallback hits and misses do not scan the vault for each link.
-        let mut basename_targets: HashMap<String, String> = HashMap::new();
+    /// Resolve the complete graph once. Fresh builds own the source strings;
+    /// topology-changing refreshes borrow them until changed lists are identified.
+    fn incoming_links<'a, T>(&'a self, source: impl Fn(&'a str) -> T) -> HashMap<String, Vec<T>> {
+        // A complete graph pass needs a temporary borrowed lookup. Do not make
+        // graph rebuilding pay for an owned cache that queries may never use.
+        let targets = basename_targets(&self.records);
+        let mut incoming: HashMap<String, Vec<T>> = HashMap::new();
         for record in self.records.values() {
-            basename_targets
-                .entry(record.name.clone())
-                .and_modify(|target| {
-                    if natural_cmp(&record.path, target).is_lt() {
-                        target.clone_from(&record.path);
+            for link in &record.links {
+                if let Some(target) = resolve_link(link, &record.path, &self.records, |basename| {
+                    targets.get(basename).map(|target| (*target).to_owned())
+                }) {
+                    incoming
+                        .entry(target)
+                        .or_default()
+                        .push(source(&record.path));
+                }
+            }
+        }
+        incoming
+    }
+
+    fn build_backlinks(&mut self) {
+        let incoming = self.incoming_links(str::to_owned);
+        for (path, backlinks) in incoming {
+            if let Some(record) = self.records.get_mut(&path) {
+                // All records are newly created and unpublished in a fresh build.
+                Arc::get_mut(record).expect("fresh record").backlinks = backlinks;
+            }
+        }
+    }
+
+    fn refresh_backlinks(&mut self) {
+        // New or removed targets can change resolution anywhere in the vault.
+        // Never infer graph stability from the edited record alone.
+        let changes = {
+            let incoming = self.incoming_links(|path| path);
+            self.records
+                .iter()
+                .filter_map(|(path, record)| {
+                    let next = incoming.get(path).map(Vec::as_slice).unwrap_or(&[]);
+                    if record
+                        .backlinks
+                        .iter()
+                        .map(String::as_str)
+                        .eq(next.iter().copied())
+                    {
+                        None
+                    } else {
+                        Some((
+                            path.clone(),
+                            next.iter()
+                                .map(|path| (*path).to_owned())
+                                .collect::<Vec<_>>(),
+                        ))
                     }
                 })
-                .or_insert_with(|| record.path.clone());
+                .collect::<Vec<_>>()
+        };
+        // Only changed incoming lists copy records shared with the old snapshot.
+        for (path, backlinks) in changes {
+            Arc::make_mut(self.records.get_mut(&path).expect("indexed target")).backlinks =
+                backlinks;
         }
-        let links = self
-            .records
-            .values()
-            .flat_map(|record| {
-                record
-                    .links
-                    .iter()
-                    .map(|link| (record.path.clone(), link.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        for (from, link) in links {
-            if let Some(target) = resolve_link(&link, &from, &self.records, |basename| {
-                basename_targets.get(basename).cloned()
-            }) {
-                if let Some(record) = self.records.get_mut(&target) {
-                    record.backlinks.push(from.clone());
+    }
+
+    /// Target membership is unchanged, so relative precedence and basename
+    /// winners are identical. Apply only net edge-count changes from edited
+    /// sources; duplicates and lexicographic source order match a full traversal.
+    fn refresh_source_links(&mut self, previous: &Index, paths: &[String]) {
+        let mut changes: BTreeMap<String, BTreeMap<&str, isize>> = BTreeMap::new();
+        for path in paths.iter().collect::<BTreeSet<_>>() {
+            let Some(old) = previous.records.get(path) else {
+                continue;
+            };
+            let current = self.records.get_mut(path).expect("unchanged target set");
+            // The scanner replaces the record, but its incoming links still
+            // belong to this snapshot until the deltas below are applied.
+            Arc::get_mut(current).expect("reread record").backlinks = old.backlinks.clone();
+            if old.links == current.links {
+                continue;
+            }
+            for (links, delta) in [(&old.links, -1), (&current.links, 1)] {
+                for link in links {
+                    if let Some(target) = previous.resolve_link(link, path) {
+                        *changes.entry(target).or_default().entry(path).or_default() += delta;
+                    }
+                }
+            }
+        }
+        for (target, sources) in changes {
+            let mut deltas = sources
+                .into_iter()
+                .filter(|(_, delta)| *delta != 0)
+                .peekable();
+            if deltas.peek().is_none() {
+                continue;
+            }
+            let record = Arc::make_mut(self.records.get_mut(&target).expect("resolved target"));
+            for (source, delta) in deltas {
+                let start = record
+                    .backlinks
+                    .partition_point(|path| path.as_str() < source);
+                if delta < 0 {
+                    record.backlinks.drain(start..start + delta.unsigned_abs());
+                } else {
+                    record.backlinks.splice(
+                        start..start,
+                        std::iter::repeat_n(source.to_owned(), delta as usize),
+                    );
                 }
             }
         }
     }
+}
+
+/// The natural-order winner is fixed for the lifetime of one target set.
+fn basename_targets(records: &BTreeMap<String, Arc<FileRecord>>) -> HashMap<&str, &str> {
+    let mut targets = HashMap::new();
+    for record in records.values() {
+        targets
+            .entry(record.name.as_str())
+            .and_modify(|target: &mut &str| {
+                if natural_cmp(&record.path, target).is_lt() {
+                    *target = &record.path;
+                }
+            })
+            .or_insert(&record.path);
+    }
+    targets
 }
 
 fn frontmatter(contents: &str, limits: Limits) -> (BTreeMap<String, DataValue>, &str) {
@@ -538,7 +664,7 @@ fn load_property_types(root: &Path, limits: Limits) -> Result<HashMap<String, St
 fn resolve_link(
     link: &str,
     from: &str,
-    records: &BTreeMap<String, FileRecord>,
+    records: &BTreeMap<String, Arc<FileRecord>>,
     basename_target: impl FnOnce(&str) -> Option<String>,
 ) -> Option<String> {
     let clean = link.replace('\\', "/");

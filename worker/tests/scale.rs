@@ -13,6 +13,7 @@ use obsidian_base_worker::{
         InitialiseParams, LimitsPatch, OverlayPathParams, OverlayUpsertParams, QueryParams,
         QuerySource,
     },
+    query::{QueryInput, execute},
 };
 use tempfile::TempDir;
 
@@ -21,6 +22,131 @@ fn environment() -> ExecutionEnvironment {
         "2026-07-24T00:00:00Z".parse().unwrap(),
         jiff::tz::TimeZone::UTC,
     )
+}
+
+/// Query-only probe: indexing, filesystem I/O, and result-cache eviction are
+/// outside the timing. Run in release mode with `--ignored --nocapture
+/// --test-threads=1`. Each sample averages five complete executions, including
+/// parsing, filtering, sorting, rendering, and result-byte validation.
+/// Set `OBSIDIAN_BASE_BENCH_WORKLOAD` to natural, numeric, selective_formula, or
+/// date to isolate one query shape for process-level memory measurements.
+#[test]
+#[ignore = "manual release-mode benchmark; prints timings without a machine-specific threshold"]
+fn benchmark_query_workloads() {
+    const FILES: usize = 5_000;
+    const SAMPLES: usize = 9;
+    const BATCH: usize = 5;
+    let workload = std::env::var("OBSIDIAN_BASE_BENCH_WORKLOAD").ok();
+    if let Some(workload) = workload.as_deref() {
+        assert!(
+            ["natural", "numeric", "selective_formula", "date"].contains(&workload),
+            "unknown benchmark workload: {workload}",
+        );
+    }
+    let root = TempDir::new().unwrap();
+    let overlays = (0..FILES)
+        .map(|ordinal| {
+            (
+                format!("folder-{}/note-{ordinal}.md", ordinal % 20),
+                Overlay {
+                    contents: format!(
+                        "---\nrank: {}\nstatus: active\ndate: \"2026-07-{:02}\"\ntags: [bench]\n---\n",
+                        (ordinal * 7919) % FILES,
+                        ordinal % 28 + 1,
+                    ),
+                    created_at: 0,
+                },
+            )
+        })
+        .collect();
+    let limits = Limits {
+        evaluation_ms: 10_000,
+        result_rows: 10_000,
+        ..Limits::default()
+    };
+    let index = Index::build(
+        root.path().to_owned(),
+        &overlays,
+        &Default::default(),
+        limits,
+        Vec::new(),
+    )
+    .unwrap();
+    let environment = environment();
+    for (label, filters, formulas, sort, count) in [
+        ("natural", "", "", "", FILES),
+        (
+            "numeric",
+            "filters: file.hasTag(\"#bench\")\n",
+            "",
+            "    sort:\n      - property: rank\n        direction: ASC\n",
+            FILES,
+        ),
+        (
+            "selective_formula",
+            "filters: formula.score < 500\n",
+            "formulas:\n  score: rank + 1\n",
+            "    sort:\n      - property: formula.score\n        direction: DESC\n",
+            499,
+        ),
+        (
+            "date",
+            "",
+            "",
+            "    sort:\n      - property: property.date\n        direction: ASC\n",
+            FILES,
+        ),
+    ] {
+        if workload
+            .as_deref()
+            .is_some_and(|workload| workload != label)
+        {
+            continue;
+        }
+        let input = QueryInput {
+            text: format!(
+                "{filters}{formulas}views:\n  - type: table\n    name: Table\n    order: [file.name, rank, status]\n{sort}"
+            ),
+            source_id: "benchmark".to_owned(),
+            host_path: "folder-0/note-0.md".to_owned(),
+            view_name: None,
+            preview_rows: 20,
+        };
+        let run = || {
+            let output = execute(
+                &index,
+                limits,
+                1,
+                1,
+                &mut false,
+                &environment,
+                input.clone(),
+            )
+            .unwrap();
+            assert_eq!(output.result.matched_count, count);
+            assert_eq!(output.rows.len(), count);
+            std::hint::black_box(output);
+        };
+        for _ in 0..BATCH {
+            run();
+        }
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            for _ in 0..BATCH {
+                run();
+            }
+            samples.push(started.elapsed().as_secs_f64() * 1000.0 / BATCH as f64);
+        }
+        println!("{label}: samples_ms={samples:.3?}");
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "{label}: median_ms={:.3}, min_ms={:.3}, max_ms={:.3}",
+            samples[SAMPLES / 2],
+            samples[0],
+            samples[SAMPLES - 1],
+        );
+    }
 }
 
 #[test]
@@ -97,7 +223,7 @@ fn builds_backlinks_for_five_thousand_fallback_and_broken_links() {
     .unwrap();
     let elapsed = started.elapsed();
     eprintln!("5,001 records, 10,000 fallback/broken links: {elapsed:?}");
-    assert_eq!(index.records["Targets/Target.md"].backlinks.len(), 5_000);
+    assert_eq!(index.records()["Targets/Target.md"].backlinks.len(), 5_000);
     assert!(elapsed < Duration::from_secs(30));
 }
 
@@ -246,4 +372,130 @@ fn benchmark_single_file_changes() {
         report(&format!("fanout_{fanout}_queries"), &queries);
         report(&format!("fanout_{fanout}_total"), &totals);
     }
+}
+
+/// Exercise the cached resolver, changed-edge path, and target-set fallback.
+/// Complete snapshot replacement/destruction is timed; setup and assertions are not.
+#[test]
+#[ignore = "manual release-mode benchmark; prints timings without a machine-specific threshold"]
+fn benchmark_link_resolution_and_backlink_updates() {
+    const FILES: usize = 5_000;
+    const SAMPLES: usize = 9;
+    let root = TempDir::new().unwrap();
+    // Overlay-only leaf files qualify for named refreshes when their parents
+    // exist. Missing parents deliberately trigger a full scan instead.
+    for folder in ["notes", "Targets", "Earlier"] {
+        fs::create_dir(root.path().join(folder)).unwrap();
+    }
+    let mut overlays = (0..FILES)
+        .map(|ordinal| {
+            (
+                format!("notes/Source{ordinal}.md"),
+                Overlay {
+                    contents: "[[Target]] [[Target]]\n".into(),
+                    created_at: 0,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for path in ["Targets/Target.md", "Targets/Other.md"] {
+        overlays.insert(
+            path.into(),
+            Overlay {
+                contents: String::new(),
+                created_at: 0,
+            },
+        );
+    }
+    let mut index = Index::build(
+        root.path().to_owned(),
+        &overlays,
+        &Default::default(),
+        Limits::default(),
+        Vec::new(),
+    )
+    .unwrap();
+    let report = |label: &str, samples: &[f64]| {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        println!(
+            "{label}: samples_ms={samples:.3?}, median_ms={:.3}",
+            sorted[sorted.len() / 2]
+        );
+    };
+    let mut lookups = Vec::new();
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        for _ in 0..1_000 {
+            for link in ["Target", "Missing", "../Targets/Target"] {
+                std::hint::black_box(index.resolve_link(link, "notes/Source0.md"));
+            }
+        }
+        lookups.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    report("link_lookup_batch", &lookups);
+    let refresh = |index: &mut Index, path: &str, overlays: &BTreeMap<String, Overlay>| {
+        let hints = [path.to_owned()];
+        let started = Instant::now();
+        let next = index
+            .refresh(
+                &hints,
+                overlays,
+                &Default::default(),
+                Limits::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        *index = next;
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+    let mut unchanged = Vec::new();
+    let mut changed = Vec::new();
+    let mut created = Vec::new();
+    let mut removed = Vec::new();
+    for ordinal in 0..SAMPLES {
+        overlays.get_mut("notes/Source0.md").unwrap().contents =
+            format!("[[Target]] [[Target]]\nrevision {ordinal}\n");
+        // Restore the common two-edge source before timing its body-only edit.
+        refresh(&mut index, "notes/Source0.md", &overlays);
+        unchanged.push(refresh(&mut index, "notes/Source0.md", &overlays));
+        overlays.get_mut("notes/Source0.md").unwrap().contents =
+            "[[Other]] [[Other]] [[Target]]\n".into();
+        changed.push(refresh(&mut index, "notes/Source0.md", &overlays));
+        assert_eq!(
+            index.records()["Targets/Target.md"].backlinks.len(),
+            FILES * 2 - 1
+        );
+        assert_eq!(
+            index.records()["Targets/Other.md"].backlinks,
+            ["notes/Source0.md"; 2]
+        );
+        overlays.insert(
+            "Earlier/Target.md".into(),
+            Overlay {
+                contents: String::new(),
+                created_at: 0,
+            },
+        );
+        created.push(refresh(&mut index, "Earlier/Target.md", &overlays));
+        assert!(index.records()["Targets/Target.md"].backlinks.is_empty());
+        assert_eq!(
+            index.records()["Earlier/Target.md"].backlinks.len(),
+            FILES * 2 - 1
+        );
+        overlays.remove("Earlier/Target.md");
+        removed.push(refresh(&mut index, "Earlier/Target.md", &overlays));
+        assert_eq!(
+            index.records()["Targets/Target.md"].backlinks.len(),
+            FILES * 2 - 1
+        );
+        assert_eq!(
+            index.resolve_link("Target", "notes/Source0.md").as_deref(),
+            Some("Targets/Target.md")
+        );
+    }
+    report("backlinks_body_edit", &unchanged);
+    report("backlinks_edge_edit", &changed);
+    report("backlinks_target_create", &created);
+    report("backlinks_target_remove", &removed);
 }

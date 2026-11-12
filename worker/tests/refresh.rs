@@ -10,7 +10,65 @@ use obsidian_base_worker::{
     },
     value::DataValue,
 };
+use std::sync::Arc;
 use tempfile::TempDir;
+
+#[test]
+fn ordinary_refresh_shares_unchanged_records_and_copies_changed_backlinks() {
+    let root = TempDir::new().unwrap();
+    write(root.path(), "Source.md", "[[Target]] [[Target]]\n");
+    write(root.path(), "Target.md", "# Target\n");
+    write(root.path(), "Unrelated.md", "---\nrank: 42\n---\n");
+    let original = build(root.path(), &BTreeMap::new());
+    let mut overlays = BTreeMap::from([(
+        "Source.md".into(),
+        Overlay {
+            contents: "---\nrank: 1\n---\n[[Target]] [[Target]]\nbody edit\n".into(),
+            created_at: 0,
+        },
+    )]);
+    let edited = refresh_matches_scan(&original, &["Source.md"], &overlays);
+    assert!(Arc::ptr_eq(
+        &original.records()["Unrelated.md"],
+        &edited.records()["Unrelated.md"]
+    ));
+    assert!(Arc::ptr_eq(
+        &original.records()["Target.md"],
+        &edited.records()["Target.md"]
+    ));
+    assert!(!Arc::ptr_eq(
+        &original.records()["Source.md"],
+        &edited.records()["Source.md"]
+    ));
+    assert!(
+        !original.records()["Source.md"]
+            .properties
+            .contains_key("rank")
+    );
+    assert_eq!(
+        edited.records()["Source.md"].properties["rank"],
+        DataValue::Number(1.0)
+    );
+    overlays.get_mut("Source.md").unwrap().contents = "# Removed links\n".into();
+    let unlinked = refresh_matches_scan(&edited, &["Source.md"], &overlays);
+    assert!(!Arc::ptr_eq(
+        &edited.records()["Target.md"],
+        &unlinked.records()["Target.md"]
+    ));
+    assert_eq!(
+        original.records()["Target.md"].backlinks,
+        ["Source.md", "Source.md"]
+    );
+    assert_eq!(
+        edited.records()["Target.md"].backlinks,
+        original.records()["Target.md"].backlinks
+    );
+    assert!(unlinked.records()["Target.md"].backlinks.is_empty());
+    assert!(Arc::ptr_eq(
+        &original.records()["Unrelated.md"],
+        &unlinked.records()["Unrelated.md"]
+    ));
+}
 
 fn write(root: &Path, path: &str, contents: &str) {
     let absolute = root.join(path);
@@ -51,7 +109,7 @@ fn refresh_matches_scan(
     overlays: &BTreeMap<String, Overlay>,
 ) -> Index {
     let candidate = refresh(index, paths, overlays);
-    assert_eq!(candidate.records, build(&index.root, overlays).records);
+    assert_eq!(candidate.records(), build(&index.root, overlays).records());
     candidate
 }
 
@@ -70,8 +128,8 @@ fn edits_creations_deletions_and_overlay_only_files_match_full_scans() {
         &["Source.md", "Created.md", "Target.md"],
         &overlays,
     );
-    assert_eq!(original.records["Source.md"].tags, ["#old"]);
-    assert_eq!(edited.records["Created.md"].backlinks, ["Source.md"]);
+    assert_eq!(original.records()["Source.md"].tags, ["#old"]);
+    assert_eq!(edited.records()["Created.md"].backlinks, ["Source.md"]);
 
     overlays.insert(
         "Draft.md".into(),
@@ -81,11 +139,11 @@ fn edits_creations_deletions_and_overlay_only_files_match_full_scans() {
         },
     );
     let draft = refresh_matches_scan(&edited, &["Draft.md"], &overlays);
-    assert_eq!(draft.records["Draft.md"].ctime, 123);
-    assert_eq!(draft.records["Draft.md"].backlinks, ["Source.md"]);
+    assert_eq!(draft.records()["Draft.md"].ctime, 123);
+    assert_eq!(draft.records()["Draft.md"].backlinks, ["Source.md"]);
     overlays.clear();
     let removed = refresh_matches_scan(&draft, &["Draft.md"], &overlays);
-    assert!(!removed.records.contains_key("Draft.md"));
+    assert!(!removed.records().contains_key("Draft.md"));
 }
 
 #[test]
@@ -97,7 +155,7 @@ fn target_changes_recompute_natural_winners_relative_precedence_and_duplicate_or
     write(root.path(), "a/Source.md", "[[Target]]\n");
     let original = build(root.path(), &overlays);
     assert_eq!(
-        original.records["a10/Target.md"].backlinks,
+        original.records()["a10/Target.md"].backlinks,
         ["a/Source.md", "z/Source.md", "z/Source.md"]
     );
     write(root.path(), "a2/Target.md", "# Earlier natural winner\n");
@@ -106,21 +164,181 @@ fn target_changes_recompute_natural_winners_relative_precedence_and_duplicate_or
         winner.resolve_link("Target", "z/Source.md").as_deref(),
         Some("a2/Target.md")
     );
-    assert!(winner.records["a10/Target.md"].backlinks.is_empty());
+    assert!(winner.records()["a10/Target.md"].backlinks.is_empty());
     write(root.path(), "z/Target.md", "# Relative winner\n");
     let relative = refresh_matches_scan(&winner, &["z/Target.md"], &overlays);
     assert_eq!(
-        relative.records["z/Target.md"].backlinks,
+        relative.records()["z/Target.md"].backlinks,
         ["z/Source.md", "z/Source.md"]
     );
-    assert_eq!(relative.records["a2/Target.md"].backlinks, ["a/Source.md"]);
+    assert_eq!(
+        relative.records()["a2/Target.md"].backlinks,
+        ["a/Source.md"]
+    );
     fs::remove_file(root.path().join("z/Target.md")).unwrap();
     fs::remove_file(root.path().join("a2/Target.md")).unwrap();
     let restored = refresh_matches_scan(&relative, &["z/Target.md", "a2/Target.md"], &overlays);
     assert_eq!(
-        restored.records["a10/Target.md"].backlinks,
-        original.records["a10/Target.md"].backlinks
+        restored.records()["a10/Target.md"].backlinks,
+        original.records()["a10/Target.md"].backlinks
     );
+}
+
+#[test]
+fn batched_edge_deltas_preserve_duplicates_order_self_links_and_snapshot_isolation() {
+    let root = TempDir::new().unwrap();
+    write(
+        root.path(),
+        "Source10.md",
+        "[[Target]] [[Target]] [[Source10]]\n",
+    );
+    write(root.path(), "Source2.md", "[[Target]] [[Source10]]\n");
+    write(root.path(), "Target.md", "[[Target]]\n");
+    let original = build(root.path(), &BTreeMap::new());
+    let overlays = BTreeMap::from([
+        (
+            "Source10.md".into(),
+            Overlay {
+                // Rewritten spellings cancel to the same two Target edges.
+                contents: "[[./Target.md]] [[missing/Target]] [[Source2]]\n".into(),
+                created_at: 0,
+            },
+        ),
+        (
+            "Source2.md".into(),
+            Overlay {
+                contents: "[[Target]] [[Target]] [[Source2]] [[Source2]]\n".into(),
+                created_at: 0,
+            },
+        ),
+        (
+            "Target.md".into(),
+            Overlay {
+                contents: "[[Source10]]\n".into(),
+                created_at: 0,
+            },
+        ),
+    ]);
+    // Reverse-order and repeated hints must apply each source delta once.
+    let edited = refresh_matches_scan(
+        &original,
+        &["Target.md", "Source2.md", "Source10.md", "Source2.md"],
+        &overlays,
+    );
+    assert_eq!(
+        edited.records()["Target.md"].backlinks,
+        ["Source10.md", "Source10.md", "Source2.md", "Source2.md"]
+    );
+    assert_eq!(edited.records()["Source10.md"].backlinks, ["Target.md"]);
+    assert_eq!(
+        edited.records()["Source2.md"].backlinks,
+        ["Source10.md", "Source2.md", "Source2.md"]
+    );
+    assert_eq!(
+        original.records()["Target.md"].backlinks,
+        ["Source10.md", "Source10.md", "Source2.md", "Target.md"]
+    );
+    let restored = refresh_matches_scan(
+        &edited,
+        &["Source2.md", "Target.md", "Source10.md"],
+        &BTreeMap::new(),
+    );
+    assert_eq!(restored.records(), original.records());
+}
+
+#[test]
+fn equivalent_link_spellings_leave_unchanged_targets_shared() {
+    let root = TempDir::new().unwrap();
+    write(root.path(), "Source.md", "[[Target]] [[Target]]\n");
+    write(root.path(), "Target.md", "# Target\n");
+    let original = build(root.path(), &BTreeMap::new());
+    write(
+        root.path(),
+        "Source.md",
+        "[[./Target.md]] [[missing/Target]]\n",
+    );
+    let edited = refresh_matches_scan(&original, &["Source.md"], &BTreeMap::new());
+    assert!(Arc::ptr_eq(
+        &original.records()["Target.md"],
+        &edited.records()["Target.md"]
+    ));
+}
+
+#[test]
+fn successive_edit_and_topology_batches_match_fresh_resolution() {
+    let root = TempDir::new().unwrap();
+    let overlays = BTreeMap::new();
+    let paths = [
+        "folder2/Target.md",
+        "folder10/Target.md",
+        "From/Target.md",
+        "From/Source.md",
+        "Elsewhere/Source.md",
+        "From/image.png",
+        "Target.MD",
+    ];
+    let bodies = [
+        "[[Target]] [[Target]] [[Missing]]\n",
+        "[[../folder2/Target.md]] [[Source]] [[image.png]]\n",
+        "[[missing/Target]] [[../folder10/Target]] [[../Target.MD]]\n",
+        "[[Source]] [[./Target]] [[Target.md]] [[image]]\n",
+        "# No links\n",
+    ];
+    let mut index = build(root.path(), &overlays);
+    let mut seed = 0x5eed_u64;
+    for round in 0..120 {
+        let mut hints = Vec::new();
+        for _ in 0..3 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let path = paths[(seed >> 32) as usize % paths.len()];
+            if seed % 5 == 0 {
+                match fs::remove_file(root.path().join(path)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("{error}"),
+                }
+            } else {
+                write(
+                    root.path(),
+                    path,
+                    bodies[(seed >> 16) as usize % bodies.len()],
+                );
+            }
+            hints.push(path);
+        }
+        let old = index.clone();
+        let old_records = old
+            .records()
+            .iter()
+            .map(|(path, record)| (path.clone(), (**record).clone()))
+            .collect::<BTreeMap<_, _>>();
+        index = refresh_matches_scan(&index, &hints, &overlays);
+        let fresh = build(root.path(), &overlays);
+        for source in paths {
+            for link in [
+                "Target",
+                "Target.md",
+                "missing/Target",
+                "Source",
+                "image",
+                "image.png",
+            ] {
+                assert_eq!(
+                    index.resolve_link(link, source),
+                    fresh.resolve_link(link, source),
+                    "round {round}, {source}, {link}"
+                );
+            }
+        }
+        // Publishing later snapshots must never mutate earlier relationship data.
+        assert_eq!(
+            old.records()
+                .iter()
+                .map(|(path, record)| (path.clone(), (**record).clone()))
+                .collect::<BTreeMap<_, _>>(),
+            old_records
+        );
+    }
 }
 
 #[test]
@@ -136,13 +354,13 @@ fn named_hints_reuse_unrelated_snapshot_records_and_ambiguous_hints_scan() {
     // intentionally remain absent from this published snapshot until a full scan.
     let named = refresh(&original, &["Named.md"], &overlays);
     assert_eq!(
-        named.records["Unrelated.md"],
-        original.records["Unrelated.md"]
+        named.records()["Unrelated.md"],
+        original.records()["Unrelated.md"]
     );
     for hints in [vec![], vec![""], vec!["unknown.txt"]] {
         let scanned = refresh_matches_scan(&named, &hints, &overlays);
         assert_eq!(
-            scanned.records["Unrelated.md"].properties["rank"],
+            scanned.records()["Unrelated.md"].properties["rank"],
             DataValue::Number(2.0)
         );
     }
@@ -157,10 +375,10 @@ fn directory_hints_include_new_descendants_and_remove_supported_extension_subtre
     let original = build(root.path(), &overlays);
     write(root.path(), "folder/New.md", "# New\n");
     let added = refresh_matches_scan(&original, &["folder"], &overlays);
-    assert!(added.records.contains_key("folder/New.md"));
+    assert!(added.records().contains_key("folder/New.md"));
     fs::remove_dir_all(root.path().join("archive.md")).unwrap();
     let removed = refresh_matches_scan(&added, &["archive.md"], &overlays);
-    assert!(!removed.records.contains_key("archive.md/Child.md"));
+    assert!(!removed.records().contains_key("archive.md/Child.md"));
 }
 
 #[test]
@@ -176,7 +394,7 @@ fn metadata_schema_changes_recoerce_unmentioned_notes() {
     );
     let original = build(root.path(), &overlays);
     assert!(matches!(
-        original.records["Unrelated.md"].properties["when"],
+        original.records()["Unrelated.md"].properties["when"],
         DataValue::String(_)
     ));
     write(
@@ -186,13 +404,13 @@ fn metadata_schema_changes_recoerce_unmentioned_notes() {
     );
     let typed = refresh_matches_scan(&original, &["Named.md"], &overlays);
     assert!(matches!(
-        typed.records["Unrelated.md"].properties["when"],
+        typed.records()["Unrelated.md"].properties["when"],
         DataValue::Date(_)
     ));
     write(root.path(), ".obsidian/types.json", "{\"types\":{}}");
     let untyped = refresh_matches_scan(&typed, &[".obsidian/types.json"], &overlays);
     assert!(matches!(
-        untyped.records["Unrelated.md"].properties["when"],
+        untyped.records()["Unrelated.md"].properties["when"],
         DataValue::String(_)
     ));
 }
@@ -214,9 +432,9 @@ fn file_and_parent_symlinks_are_not_incrementally_indexed() {
     symlink(root.path().join("real"), root.path().join("alias-folder")).unwrap();
     let refreshed =
         refresh_matches_scan(&original, &["Alias.md", "alias-folder/Note.md"], &overlays);
-    assert_eq!(refreshed.records.len(), 1);
-    assert!(!refreshed.records.contains_key("Alias.md"));
-    assert!(!refreshed.records.contains_key("alias-folder/Note.md"));
+    assert_eq!(refreshed.records().len(), 1);
+    assert!(!refreshed.records().contains_key("Alias.md"));
+    assert!(!refreshed.records().contains_key("alias-folder/Note.md"));
 }
 
 #[test]

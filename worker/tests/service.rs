@@ -11,6 +11,7 @@ use obsidian_base_worker::{
         FetchRowsParams, InitialiseParams, LimitsPatch, OverlayPathParams, OverlayUpsertParams,
         QueryParams, QuerySource,
     },
+    query::CellKind,
 };
 
 fn environment() -> ExecutionEnvironment {
@@ -119,7 +120,7 @@ fn fixture_views_match_the_reference_results() {
         paths(&activity),
         ["Activities/Clean kitchen.md", "Activities/Review work.md"]
     );
-    assert_eq!(activity.preview_rows[0].cells[2].kind, "link");
+    assert_eq!(activity.preview_rows[0].cells[2].kind, CellKind::Link);
     let file = service
         .query(
             QueryParams {
@@ -398,6 +399,93 @@ fn overlay_only_host_and_formula_cache_work() {
             .code,
         "missing_host"
     );
+}
+
+#[test]
+fn prepared_sort_keys_preserve_original_formula_values() {
+    for (values, expected_paths) in [
+        (
+            ["2026-07-02T00:00:00Z", "2026-07-02T01:00:00+02:00"],
+            ["B.md", "A.md"],
+        ),
+        (["2 days", "1 day"], ["B.md", "A.md"]),
+        (["2 days", "plain text"], ["A.md", "B.md"]),
+    ] {
+        let vault = tempfile::tempdir().unwrap();
+        let mut service = WorkerService::new();
+        for (name, value) in ["A", "B"].into_iter().zip(values) {
+            fs::write(
+                vault.path().join(format!("{name}.md")),
+                format!("---\nkey: \"{value}\"\n---\n"),
+            )
+            .unwrap();
+        }
+        service
+            .initialize(InitialiseParams {
+                vault_root: vault.path().to_string_lossy().into_owned(),
+                metadata_overrides: BTreeMap::new(),
+                limits: LimitsPatch::default(),
+            })
+            .unwrap();
+        let source = "filters: key\nformulas:\n  cached: key\nviews:\n  - type: table\n    name: Table\n    sort:\n      - property: formula.cached\n    order: [formula.cached, key, this.name]\n";
+        let result = service
+            .query(inline_query_at(source, "Table", "A.md"), &environment())
+            .unwrap();
+        assert_eq!(paths(&result), expected_paths);
+        for row in result.preview_rows {
+            let ordinal = if row.path == "A.md" { 0 } else { 1 };
+            assert_eq!(row.cells[0].kind, CellKind::String);
+            assert_eq!(row.cells[0].text, values[ordinal]);
+            assert_eq!(row.cells[1].text, values[ordinal]);
+            assert_eq!(row.cells[2].text, "A");
+        }
+    }
+}
+
+#[test]
+fn formula_state_survives_filter_sort_and_limited_rendering() {
+    let vault = tempfile::tempdir().unwrap();
+    for (name, rank) in [("A", 0), ("B", 1), ("C", 2)] {
+        fs::write(
+            vault.path().join(format!("{name}.md")),
+            format!("---\nrank: {rank}\n---\n"),
+        )
+        .unwrap();
+    }
+    let source = "filters: formula.score >= 2\nformulas:\n  score: rank + 1\nviews:\n  - type: table\n    name: Table\n    limit: 1\n    sort:\n      - property: formula.score\n        direction: DESC\n    order: [file.name, formula.score, formula.score, this.name]\n";
+    // Filtering costs 7 steps per record, sorting reuses each matched formula
+    // for 2 steps, and the single rendered row costs 8 steps: 21 + 4 + 8 = 33.
+    for steps in [33, 32] {
+        let mut service = WorkerService::new();
+        service
+            .initialize(InitialiseParams {
+                vault_root: vault.path().to_string_lossy().into_owned(),
+                metadata_overrides: BTreeMap::new(),
+                limits: LimitsPatch {
+                    evaluation_steps: NonZeroU64::new(steps),
+                    ..LimitsPatch::default()
+                },
+            })
+            .unwrap();
+        let result = service.query(inline_query_at(source, "Table", "A.md"), &environment());
+        if steps == 32 {
+            assert_eq!(result.unwrap_err().code, "evaluation_limit");
+            continue;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.matched_count, 2);
+        assert_eq!(result.view_count, 1);
+        assert!(result.truncated);
+        assert_eq!(paths(&result), ["C.md"]);
+        assert_eq!(
+            result.preview_rows[0]
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<Vec<_>>(),
+            ["C", "3", "3", "A"],
+        );
+    }
 }
 
 #[test]

@@ -67,24 +67,30 @@ fn backlinks_preserve_relative_precedence_and_natural_basename_fallback() {
         );
     }
     assert_eq!(
-        index.records["From/Target.md"].backlinks,
+        index.records()["From/Target.md"].backlinks,
         ["From/Host.md"; 2]
     );
     assert_eq!(
-        index.records["Folder10/Target.md"].backlinks,
+        index.records()["Folder10/Target.md"].backlinks,
         ["From/Host.md"]
     );
     assert_eq!(
-        index.records["Folder2/Target.md"].backlinks,
+        index.records()["Folder2/Target.md"].backlinks,
         ["From/Host.md", "From/Host.md", "Other.md"]
     );
-    assert!(index.records["Folder02/Target.md"].backlinks.is_empty());
+    assert!(index.records()["Folder02/Target.md"].backlinks.is_empty());
     assert_eq!(
-        index.records["Elsewhere/Only.md"].backlinks,
+        index.records()["Elsewhere/Only.md"].backlinks,
         ["From/Host.md"]
     );
-    assert_eq!(index.records["From/image.png"].backlinks, ["From/Host.md"]);
-    assert_eq!(index.records["Elsewhere/image.pdf"].backlinks, ["Other.md"]);
+    assert_eq!(
+        index.records()["From/image.png"].backlinks,
+        ["From/Host.md"]
+    );
+    assert_eq!(
+        index.records()["Elsewhere/image.pdf"].backlinks,
+        ["Other.md"]
+    );
 }
 
 #[test]
@@ -100,11 +106,11 @@ fn backlink_winners_include_overlay_only_records_and_change_with_each_build() {
         },
     )]);
     let index = build(root.path(), &overlays);
-    assert_eq!(index.records["Folder2/Target.md"].backlinks, ["Host.md"]);
-    assert!(index.records["Folder10/Target.md"].backlinks.is_empty());
-    assert_eq!(index.records["Host.md"].backlinks, ["Folder2/Target.md"]);
+    assert_eq!(index.records()["Folder2/Target.md"].backlinks, ["Host.md"]);
+    assert!(index.records()["Folder10/Target.md"].backlinks.is_empty());
+    assert_eq!(index.records()["Host.md"].backlinks, ["Folder2/Target.md"]);
 
     let index = build(root.path(), &BTreeMap::new());
-    assert_eq!(index.records["Folder10/Target.md"].backlinks, ["Host.md"]);
-    assert!(index.records["Host.md"].backlinks.is_empty());
+    assert_eq!(index.records()["Folder10/Target.md"].backlinks, ["Host.md"]);
+    assert!(index.records()["Host.md"].backlinks.is_empty());
 }
